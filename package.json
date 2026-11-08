@@ -10,6 +10,10 @@
     "type": "git",
     "url": "https://github.com/DarbeChan/dsh-qizhoucnc-cam.git"
   },
+  "bugs": {
+    "url": "https://github.com/DarbeChan/dsh-qizhoucnc-cam/issues",
+    "email": "651712988@qq.com"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

@@ -18,6 +18,10 @@
 
 将本目录作为 DSH 插件安装（本地链接或打包为 bundle），启用后即可在界面右侧标签栏看到 `QizhouCNC_CAM`。
 
+## 问题反馈
+
+遇到 bug 或想提建议，请到 [GitHub Issues](https://github.com/DarbeChan/dsh-qizhoucnc-cam/issues) 提交，或邮件联系 **651712988@qq.com**。
+
 ## 署名与许可
 
 本插件由**成都起舟机械科技有限公司**制作，**仅供研究学习使用**，不提供任何形式的商用保证。
