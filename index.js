@@ -2,7 +2,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
-import { join, dirname, basename, isAbsolute, resolve } from 'node:path';
+import { join, dirname, basename, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -146,16 +146,31 @@ function loadToolpathFromFile(filePath) {
 
 // ---- read a single NC file's raw text (for preview/editing) ----
 function readNcText(filePath) {
-  const p = resolvePath(filePath);
-  if (!existsSync(p)) throw new Error('NC file not found: ' + p);
+  const p = assertNcPath(filePath);
   return readFileSync(p, 'utf8');
+}
+
+// ---- validate that a path is a permitted NC file inside a known workspace ----
+const NC_EXT = /\.(nc|cnc|gcode)$/i;
+function assertNcPath(filePath) {
+  const p = resolvePath(filePath);
+  // 1) must be a real file (not a directory)
+  if (!existsSync(p)) throw new Error('NC file not found: ' + p);
+  // 2) extension must be a known NC/G-code suffix
+  if (!NC_EXT.test(p)) throw new Error('Unsupported file type (allowed: .nc / .cnc / .gcode): ' + p);
+  // 3) must reside inside a known DSH workspace (or the process cwd)
+  const rel = (a, b) => { const r = relative(a, b); return r === '' || (!r.startsWith('..') && !isAbsolute(r)); };
+  const dir = dirname(p);
+  const { all } = getWorkspaceInfo();
+  const within = all.some((ws) => rel(ws, dir));
+  if (!within) throw new Error('File is outside the workspace: ' + p);
+  return p;
 }
 
 // ---- save edited NC text back to the file, then re-parse the toolpath ----
 function saveNcText(filePath, content) {
-  const p = resolvePath(filePath);
+  const p = assertNcPath(filePath);
   if (typeof content !== 'string') throw new Error('content must be a string');
-  if (!existsSync(p)) throw new Error('NC file not found: ' + p);
   writeFileSync(p, content, 'utf8');
   const tp = buildToolpath(content);
   tp.file = p;
@@ -165,7 +180,6 @@ function saveNcText(filePath, content) {
 }
 
 // ---- scan the workspace for files matching an extension, dedup by name ----
-const NC_EXT = /\.(nc|cnc|gcode)$/i;
 const STEP_EXT = /\.(step|stp)$/i;
 function scanFiles(rootDir, extRe, maxDepth = 5) {
   const seen = new Map(); // name(lowercased) -> { name, path, mtime }
