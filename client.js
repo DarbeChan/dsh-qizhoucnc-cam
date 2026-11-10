@@ -389,6 +389,17 @@ window.__ModuleLoader__.load({
       background: 'var(--dsw-alias-bg-base, #fff)', color: 'var(--dsw-alias-label-primary, #111)',
       padding: '6px 4px', boxShadow: '-2px 0 6px -3px rgba(16,24,40,0.25)',
     };
+    // resize handle INSIDE the panel, on its LEFT edge, full height — drag to resize width
+    const RESIZE_HANDLE = {
+      position: 'absolute', left: 0, top: 0, bottom: 0, width: 8,
+      cursor: 'col-resize', zIndex: 901, pointerEvents: 'auto',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+    };
+    const RESIZE_HANDLE_BAR = {
+      width: 3, height: '42%', borderRadius: 2,
+      background: 'var(--dsw-alias-border-l2, #d1d5db)',
+      opacity: 0.5, transition: 'opacity .15s',
+    };
     // expand handle on the screen RIGHT edge (collapsed state)
     const HANDLE_RIGHT = {
       position: 'absolute', right: 0, top: '50%', transform: 'translateY(-50%)',
@@ -422,6 +433,47 @@ window.__ModuleLoader__.load({
       const [listExpanded, setListExpanded] = React.useState(false);
       const [diagCwd, setDiagCwd] = React.useState(null);
       const [editingFile, setEditingFile] = React.useState(null);
+      // 可拖拽调节的面板宽度（像素），持久化到 localStorage
+      const [panelWidth, setPanelWidth] = React.useState(() => {
+        try {
+          const saved = globalThis.localStorage?.getItem('dsh-cam-panel-width');
+          const n = saved ? parseInt(saved, 10) : NaN;
+          if (Number.isFinite(n) && n >= 360 && n <= 1400) return n;
+        } catch { /* ignore */ }
+        return 760;
+      });
+      const dragging = React.useRef(null);
+      const startResize = React.useCallback((e) => {
+        e.preventDefault();
+        dragging.current = { startX: e.clientX, startW: panelWidth };
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+      }, [panelWidth]);
+      React.useEffect(() => {
+        if (typeof window === 'undefined') return;
+        const onMove = (e) => {
+          const d = dragging.current;
+          if (!d) return;
+          // 面板靠右，向左拖（clientX 减小）则变宽
+          const w = Math.min(1400, Math.max(360, d.startW + (d.startX - e.clientX)));
+          setPanelWidth(w);
+        };
+        const onUp = () => {
+          if (!dragging.current) return;
+          dragging.current = null;
+          document.body.style.cursor = '';
+          document.body.style.userSelect = '';
+          setPanelWidth((w) => { try { globalThis.localStorage?.setItem('dsh-cam-panel-width', String(Math.round(w))); } catch { /* ignore */ } return w; });
+        };
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp);
+        window.addEventListener('pointercancel', onUp);
+        return () => {
+          window.removeEventListener('pointermove', onMove);
+          window.removeEventListener('pointerup', onUp);
+          window.removeEventListener('pointercancel', onUp);
+        };
+      }, []);
 
       const sessionList = useSessions ? useSessions((s) => s) : null;
       const byId = sessionList?.byId ?? {};
@@ -579,7 +631,13 @@ window.__ModuleLoader__.load({
         }, '⤴')));
 
       return h('div', { style: ROOT, 'data-dsh-cam-overlay': '' },
-        h('div', { style: PANEL, 'data-dsh-cam-panel': '' },
+        h('div', { style: { ...PANEL, width: panelWidth }, 'data-dsh-cam-panel': '' },
+          h('div', {
+            style: RESIZE_HANDLE,
+            onPointerDown: startResize,
+            title: '拖动调节面板宽度',
+            'aria-label': '拖动调节面板宽度',
+          }, h('span', { style: RESIZE_HANDLE_BAR })),
           h('button', { style: HANDLE_LEFT, onClick: () => setOpen(false), title: '收起面板', 'aria-label': '收起面板' },
             h(Chevron, { dir: 'right', size: 14 })),
           editingFile
