@@ -241,7 +241,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function NcEditor({ file, sessionId, onClose }) {
+    function NcEditor({ file, sessionId, version, onClose }) {
       const [text, setText] = React.useState('');
       const [loaded, setLoaded] = React.useState(false);
       const [err, setErr] = React.useState(null);
@@ -314,7 +314,7 @@ window.__ModuleLoader__.load({
           if (d.ok) { setText(d.content ?? ''); setLoaded(true); }
           else setErr(d.error || '读取失败');
         }).catch((e) => setErr(String(e)));
-      }, [file]);
+      }, [file, version]);
 
       const save = () => {
         if (!file || !loaded) return;
@@ -433,6 +433,11 @@ window.__ModuleLoader__.load({
       const [listExpanded, setListExpanded] = React.useState(false);
       const [diagCwd, setDiagCwd] = React.useState(null);
       const [editingFile, setEditingFile] = React.useState(null);
+      // feature 2: force NcEditor to re-fetch when the underlying NC file changed on disk
+      const [editVersion, setEditVersion] = React.useState(0);
+      // feature 3: NC files the model just modified (surfaced for a quick jump)
+      const [changedNc, setChangedNc] = React.useState([]);
+      const panelRef = React.useRef(null);
       // 可拖拽调节的面板宽度（像素），持久化到 localStorage
       const [panelWidth, setPanelWidth] = React.useState(() => {
         try {
@@ -497,7 +502,42 @@ window.__ModuleLoader__.load({
           if (d.ok) { setFiles({ nc: d.nc || [], steps: d.steps || [] }); setDiagCwd(d.sessionCwd ?? null); }
         }).catch(() => {});
       }, [sessionId, sessionCwd, pickedDirs]);
+
+      // feature 3: poll the changed-NC endpoint (host accumulates workspace-changes summaries)
+      const loadChangedNc = React.useCallback(() => {
+        if (!sessionId) return;
+        fetch('/dsh-cam/changed' + (sessionId ? '?session=' + encodeURIComponent(sessionId) : ''))
+          .then((r) => r.json())
+          .then((d) => { if (d.ok && Array.isArray(d.files) && d.files.length) setChangedNc(d.files); })
+          .catch(() => {});
+      }, [sessionId]);
+
+      // feature 2: watch the currently open/active NC file for on-disk changes (AI edits)
+      React.useEffect(() => {
+        const target = editingFile || activeFile;
+        if (!target) return;
+        let stop = false;
+        let last = '';
+        const poll = async () => {
+          try {
+            const r = await fetch('/dsh-cam/nc?file=' + encodeURIComponent(target) + '&t=' + Date.now());
+            const d = await r.json();
+            if (!stop && d.ok && typeof d.content === 'string') {
+              if (last !== '' && last !== d.content) setEditVersion((v) => v + 1);
+              last = d.content;
+            }
+          } catch { /* ignore */ }
+        };
+        poll();
+        const t = setInterval(poll, 2000);
+        return () => { stop = true; clearInterval(t); };
+      }, [editingFile, activeFile]);
       React.useEffect(() => { load(); loadFiles(); }, [load, loadFiles]);
+      React.useEffect(() => {
+        loadChangedNc();
+        const t = setInterval(loadChangedNc, 3000);
+        return () => clearInterval(t);
+      }, [loadChangedNc]);
 
       const post = React.useCallback((path, body) => fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).then((r) => r.json()), []);
 
@@ -547,6 +587,21 @@ window.__ModuleLoader__.load({
       }, [modelFile, post, load, loadFiles]);
 
       const ncCount = files.nc.length;
+
+      // feature 1: clicking anywhere outside the panel collapses it to the right sidebar
+      React.useEffect(() => {
+        if (!open) return;
+        if (typeof window === 'undefined' || typeof document === 'undefined') return;
+        const onDown = (e) => {
+          const node = panelRef.current;
+          if (!node) return;
+          // ignore clicks on anything inside the panel or the resize/handle subtree
+          if (node.contains(e.target)) return;
+          setOpen(false);
+        };
+        document.addEventListener('pointerdown', onDown, true);
+        return () => document.removeEventListener('pointerdown', onDown, true);
+      }, [open]);
 
       if (!open) {
         return h('div', { style: ROOT },
@@ -631,7 +686,7 @@ window.__ModuleLoader__.load({
         }, '⤴')));
 
       return h('div', { style: ROOT, 'data-dsh-cam-overlay': '' },
-        h('div', { style: { ...PANEL, width: panelWidth }, 'data-dsh-cam-panel': '' },
+        h('div', { style: { ...PANEL, width: panelWidth }, 'data-dsh-cam-panel': '', ref: panelRef },
           h('div', {
             style: RESIZE_HANDLE,
             onPointerDown: startResize,
@@ -641,7 +696,7 @@ window.__ModuleLoader__.load({
           h('button', { style: HANDLE_LEFT, onClick: () => setOpen(false), title: '收起面板', 'aria-label': '收起面板' },
             h(Chevron, { dir: 'right', size: 14 })),
           editingFile
-            ? h(NcEditorBoundary, null, h(NcEditor, { file: editingFile, sessionId, onClose: () => { setEditingFile(null); load(); loadFiles(); } }))
+            ? h(NcEditorBoundary, null, h(NcEditor, { file: editingFile, sessionId, version: editVersion, onClose: () => { setEditingFile(null); load(); loadFiles(); } }))
             : h(React.Fragment, null,
           h('div', { style: { padding: '10px 12px 6px', borderBottom: '1px solid var(--dsw-alias-border-l1, #eceff3)' } },
             h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 } },
@@ -652,6 +707,37 @@ window.__ModuleLoader__.load({
               h('button', { style: btn, onClick: loadFiles, title: '重新扫描工作区的 NC 文件' }, '扫描'),
               h('button', { style: btn, onClick: () => { load(); loadFiles(); }, title: '刷新' }, '刷新')),
             diagCwd ? h('div', { style: { fontSize: 10, color: 'var(--dsw-alias-state-business-primary, #2563eb)', marginBottom: 4, wordBreak: 'break-all' }, title: '当前会话工作区（sessionId: ' + (sessionId || '无') + '）' }, '当前工作区：' + diagCwd) : null,
+            changedNc.length > 0
+              ? h('div', {
+                  style: {
+                    margin: '4px 0 6px', padding: '8px 10px', borderRadius: 8,
+                    background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)', border: '1px solid var(--dsw-alias-brand-primary, #2563eb)',
+                  },
+                },
+                  h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 } },
+                    h('span', { style: { flex: 1, fontSize: 11, fontWeight: 600, color: 'var(--dsw-alias-label-primary, #111)' } },
+                      '✨ AI 刚修改了 ' + changedNc.length + ' 个 NC 文件，点击直接打开：'),
+                    h('button', {
+                      onClick: () => { setChangedNc([]); if (sessionId) fetch('/dsh-cam/changed?session=' + encodeURIComponent(sessionId) + '&seq=1').catch(() => {}); },
+                      style: { ...btn, fontSize: 11, padding: '2px 8px' },
+                    }, '忽略')),
+                  h('div', { style: { display: 'flex', flexDirection: 'column', gap: 3 } },
+                    changedNc.map((f) => h('button', {
+                      key: f.path,
+                      onClick: () => { setEditingFile(f.path); setOpen(true); },
+                      title: f.path,
+                      style: {
+                        display: 'flex', alignItems: 'center', gap: 6, textAlign: 'left', cursor: 'pointer',
+                        padding: '4px 8px', fontSize: 12, borderRadius: 5,
+                        border: 'none', background: 'transparent',
+                        color: 'var(--dsw-alias-brand-primary, #2563eb)',
+                      },
+                    },
+                      h('span', { style: { fontSize: 12 } }, '📄'),
+                      h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, f.display || f.path),
+                      h('span', { style: { fontSize: 10, color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, (f.added > 0 ? '+' + f.added : '') + (f.deleted > 0 ? (f.added > 0 ? ' −' : '−') + f.deleted : '')))),
+                ))
+              : null,
             ncCount === 0
               ? h('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } }, '工作区未发现 .nc/.cnc/.gcode 文件，点「选择路径」或「扫描」')
               : h(React.Fragment, null,

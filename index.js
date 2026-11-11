@@ -15,6 +15,10 @@ const WORKSPACE_STORE = join(homedir(), '.dsh', 'storages', 'workspace.json');
 // Latest parsed toolpath, exposed to the floating viewer over a same-origin route.
 let latestToolpath = null;
 
+// DSH-modified .nc files per session, surfaced to the client for a quick jump (feature 3).
+// sessionId -> { seq, files: [{ path(absolute), display, added, deleted }] }
+let changedNcFiles = {};
+
 function resolvePath(p) {
   return isAbsolute(p) ? p : resolve(process.cwd(), p);
 }
@@ -232,7 +236,7 @@ function generateToolpathFromModel(modelPath, opts = {}) {
 }
 
 export const name = 'dsh-cam';
-export const inject = ['tools'];
+export const inject = ['tools', 'workspaceChanges'];
 
 export function apply(ctx, config = {}) {
   const freecadBin = config.freecadBin ?? FREECAD_BIN;
@@ -390,6 +394,23 @@ export function apply(ctx, config = {}) {
         }
       },
     }));
+
+    // NC files this session's model has modified, for a quick jump (feature 3).
+    routeDisposers.push(server.register({
+      kind: 'prefix',
+      path: '/dsh-cam/changed',
+      handler: async (req, res) => {
+        try {
+          const url = new URL(req.url ?? '/', 'http://localhost');
+          const sessionParam = url.searchParams.get('session');
+          const seq = url.searchParams.get('seq');
+          if (seq !== null) delete changedNcFiles[sessionParam || ''];
+          send(res, { ok: true, session: sessionParam, files: (sessionParam && changedNcFiles[sessionParam]) || [], seq: seq ?? null });
+        } catch (e) {
+          send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
+        }
+      },
+    }));
   };
   ensureRoutes();
   const retry = setInterval(() => { if (routeDisposers.length === 0) ensureRoutes(); }, 100);
@@ -510,5 +531,43 @@ export function apply(ctx, config = {}) {
     disposers.forEach((d) => d());
     routeDisposers.forEach((d) => d());
     routeDisposers = [];
+    unlistenChanges();
   });
+
+  // Listen for DSH model edits to NC files and surface them for a quick jump (feature 3).
+  // The workspace-changes service serves summaries only on request (summary(sessionId, seq)),
+  // so we consume the 'session/event' event (workspace/changes) to learn the seq, then read
+  // the summary and filter to .nc files. We tolerate races (summary may resolve a tick later)
+  // by reading on both the event and a short settle timer.
+  let unlistenChanges = () => {};
+  try {
+    if (typeof ctx.on === 'function' && ctx.get?.('workspaceChanges')) {
+      unlistenChanges = ctx.on('session/event', async (session, event) => {
+        try {
+          if (!event || event.type !== 'workspace/changes') return;
+          const sessionId = session?.id;
+          if (!sessionId) return;
+          const wc = ctx.get('workspaceChanges');
+          if (!wc || typeof wc.summary !== 'function') return;
+          const seq = event.seq;
+          const read = () => {
+            const s = wc.summary(sessionId, seq);
+            if (!s || !Array.isArray(s.files)) return;
+            const nc = s.files
+              .filter((f) => f && typeof f.path === 'string' && NC_EXT.test(f.path))
+              .map((f) => ({
+                path: isAbsolute(f.path) ? f.path : join(s.cwd || '', f.path),
+                display: f.display ?? f.path,
+                added: f.added ?? 0,
+                deleted: f.deleted ?? 0,
+              }));
+            if (nc.length) changedNcFiles[sessionId] = { seq, files: nc };
+          };
+          read();
+          // summary may not be committed yet when the event fires; retry a few times
+          for (let i = 0; i < 5; i++) setTimeout(read, 200 * (i + 1));
+        } catch { /* ignore */ }
+      });
+    }
+  } catch { /* ignore */ }
 }
