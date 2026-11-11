@@ -7,6 +7,40 @@ window.__ModuleLoader__.load({
     // （ConversationController.input = InputHub）。立即加载时序下 apply 阶段该服务可能尚未就绪。
     let appCtx = null;
 
+    // ============ dsh-resource://file 地址解码（与 DSH docpreview 同源语义） ============
+    // 会话中蓝色文件名点击 → openFile → sidebarRight.openResource(dsh-resource://file/session/<id>/<path>)
+    // 本插件注册更高优先级(extension)的 tab 类型接管 .nc/.cnc/.gcode，解码地址后在本插件编辑器打开。
+    const FILE_ADDRESS_PREFIX = 'dsh-resource://file/';
+    function basenameOf(path) { return String(path || '').split(/[\\/]/).filter(Boolean).pop() || path; }
+    function isWindowsStylePath(value) { return /^[A-Za-z]:[/\\]/.test(value) || value.startsWith('\\\\'); }
+    function isAbsoluteWorkspacePath(path) { return path.startsWith('/') || isWindowsStylePath(path); }
+    function resolveWorkspacePath(cwd, path) {
+      if (isAbsoluteWorkspacePath(path)) return path;
+      if (cwd === undefined || cwd === '') return path;
+      const separator = isWindowsStylePath(cwd) && cwd.includes('\\') ? '\\' : '/';
+      return cwd.replace(/[/\\]+$/, '') + separator + path.replace(/^(?:\.?[/\\])+/, '');
+    }
+    function parseFileAddress(address) {
+      try {
+        if (!address || !address.startsWith(FILE_ADDRESS_PREFIX)) return undefined;
+        const end = address.search(/[?#]/);
+        const [scope, ...rest] = address.slice(FILE_ADDRESS_PREFIX.length, end === -1 ? undefined : end).split('/');
+        if (scope === 'session') {
+          const [id, ...segments] = rest;
+          if (id === undefined || id === '' || segments.length === 0) return undefined;
+          return { scope, sessionId: decodeURIComponent(id), path: segments.map(decodeURIComponent).join('/') };
+        }
+        if (scope === 'absolute') {
+          const unc = rest[0] === '' && rest.length > 1;
+          const segments = (unc ? rest.slice(1) : rest).map(decodeURIComponent);
+          if (segments.length === 0 || segments[0] === '') return undefined;
+          if (unc) return { scope, path: '//' + segments.join('/') };
+          return { scope, path: /^[A-Za-z]:/.test(segments[0]) ? segments.join('/') : '/' + segments.join('/') };
+        }
+        return undefined;
+      } catch (e) { return undefined; }
+    }
+
     // ============ 3D projection (yaw around Z, then pitch around X) ============
     function project3d(p, yaw, pitch) {
       const [x, y, z] = p;
@@ -366,6 +400,33 @@ window.__ModuleLoader__.load({
             },
             onClick: () => { doQuote(menu.sel, menu.startLine, menu.endLine); setMenu(null); },
           }, '引用到对话框')) : null);
+    }
+
+    // ============ 右栏 tab 类型：接管会话中蓝色 .nc 文件名的点击（feature 4） ============
+    // DSH 蓝色文件名点击默认由 kind="text"(fallback) 预览；这里注册 priority="extension" 的
+    // 类型，用更精确的 NC 扩展名 patterns 抢在 fallback 之前认领，把编辑器搬进右栏 tab。
+    const NC_TAB_TYPE_ID = 'dsh-cam-toolpath-tab';
+    const NC_TAB_KIND = 'nc-toolpath';
+
+    function NcToolpathTab({ useTabInfo, useSessions }) {
+      const { tab, actions } = useTabInfo();
+      const sessions = useSessions ? useSessions((s) => s) : null;
+      const parsed = React.useMemo(() => parseFileAddress(tab.contentId), [tab.contentId]);
+      const byId = sessions && sessions.byId ? sessions.byId : {};
+      const sessionId = parsed && parsed.scope === 'session' ? parsed.sessionId : null;
+      const cwd = sessionId && byId[sessionId] ? (byId[sessionId].cwd || null) : null;
+      const file = React.useMemo(() => {
+        if (!parsed) return null;
+        return resolveWorkspacePath(cwd || '', parsed.path);
+      }, [parsed, cwd]);
+
+      if (!parsed || !file) {
+        return h('div', { style: { padding: 16, color: 'var(--dsw-alias-label-secondary, #6b7280)', fontSize: 13 } },
+          '无法解析该 NC 文件地址');
+      }
+      const closeTab = () => { try { if (actions && typeof actions.close === 'function') actions.close(); } catch (e) { /* ignore */ } };
+      return h(NcEditorBoundary, null,
+        h(NcEditor, { file, sessionId, version: 0, onClose: closeTab }));
     }
 
     // ============ floating panel ============
@@ -766,12 +827,37 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots'],
+      inject: ['slots', 'sidebarRightTabs'],
       apply(ctx) {
         appCtx = ctx;
         ctx.effect(() => ctx.slots.inject('shell.overlay', () => ctx.slots.register({
           name: 'shell.overlay', id: 'dsh-cam-toolpath', order: 90, label: 'QizhouCNC_CAM',
         }, ToolpathPanel)), 'dsh-cam: floating toolpath panel');
+
+        // feature 4: 接管会话中 .nc/.cnc/.gcode 文件名的点击，跳转到本插件编辑界面
+        ctx.effect(() => ctx.sidebarRightTabs.register({
+          id: NC_TAB_TYPE_ID,
+          kind: NC_TAB_KIND,
+          patterns: [
+            'dsh-resource://file/**/*.nc',
+            'dsh-resource://file/**/*.cnc',
+            'dsh-resource://file/**/*.gcode',
+            '**/*.nc', '**/*.cnc', '**/*.gcode',
+          ],
+          priority: 'extension',
+          canOpen: (address) => {
+            const parsed = parseFileAddress(address);
+            return !!parsed && /\.(nc|cnc|gcode)$/i.test(parsed.path);
+          },
+          title: (address) => {
+            const parsed = parseFileAddress(address);
+            return parsed ? basenameOf(parsed.path) : 'NC 程序';
+          },
+        }), 'dsh-cam: sidebar nc-toolpath tab type');
+
+        ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
+          name: 'sidebar.right.pane.tab', key: NC_TAB_TYPE_ID,
+        }, NcToolpathTab)), 'dsh-cam: sidebar nc-toolpath tab body');
       },
     };
   },
