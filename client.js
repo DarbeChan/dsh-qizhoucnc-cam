@@ -685,6 +685,7 @@ window.__ModuleLoader__.load({
         },
           h('button', {
             onClick: () => loadNc(f.path),
+            onDoubleClick: () => setEditingFile(f.path),
             style: {
               display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0, textAlign: 'left',
               padding: '5px 8px', fontSize: 12, cursor: 'pointer',
