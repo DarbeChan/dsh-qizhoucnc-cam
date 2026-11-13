@@ -362,23 +362,10 @@ window.__ModuleLoader__.load({
           .finally(() => setBusy(false));
       };
 
-      // 保存当前编辑（若有改动）后，跳转到该 NC 文件对应的刀路视图
+      // 直接跳转到该 NC 文件对应的刀路视图（等价于「返回」+ 单击该文件名，不保存、不进入保存中状态）
       const viewToolpath = () => {
-        setBusy(true); setErr(null);
-        const finish = () => {
-          if (typeof onViewToolpath === 'function') onViewToolpath();
-          else if (typeof onClose === 'function') onClose();
-        };
-        if (file && loaded) {
-          post('/dsh-cam/save', { file, content: text })
-            .then((d) => {
-              if (d.ok) { setSavedAt(new Date().toLocaleTimeString()); finish(); }
-              else { setErr(d.error || '保存失败'); setBusy(false); }
-            })
-            .catch((e) => { setErr(String(e)); setBusy(false); });
-        } else {
-          finish();
-        }
+        if (typeof onViewToolpath === 'function') onViewToolpath();
+        else if (typeof onClose === 'function') onClose();
       };
 
       const onKey = (e) => {
