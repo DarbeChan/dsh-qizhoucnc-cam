@@ -275,7 +275,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function NcEditor({ file, sessionId, version, onClose }) {
+    function NcEditor({ file, sessionId, version, onClose, onViewToolpath }) {
       const [text, setText] = React.useState('');
       const [loaded, setLoaded] = React.useState(false);
       const [err, setErr] = React.useState(null);
@@ -362,6 +362,25 @@ window.__ModuleLoader__.load({
           .finally(() => setBusy(false));
       };
 
+      // 保存当前编辑（若有改动）后，跳转到该 NC 文件对应的刀路视图
+      const viewToolpath = () => {
+        setBusy(true); setErr(null);
+        const finish = () => {
+          if (typeof onViewToolpath === 'function') onViewToolpath();
+          else if (typeof onClose === 'function') onClose();
+        };
+        if (file && loaded) {
+          post('/dsh-cam/save', { file, content: text })
+            .then((d) => {
+              if (d.ok) { setSavedAt(new Date().toLocaleTimeString()); finish(); }
+              else { setErr(d.error || '保存失败'); setBusy(false); }
+            })
+            .catch((e) => { setErr(String(e)); setBusy(false); });
+        } else {
+          finish();
+        }
+      };
+
       const onKey = (e) => {
         if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') { e.preventDefault(); save(); }
         if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); onClose(); }
@@ -376,6 +395,7 @@ window.__ModuleLoader__.load({
           savedAt ? h('span', { style: { fontSize: 12, fontWeight: 600, color: '#ffffff', background: '#16a34a', padding: '2px 10px', borderRadius: 10, flex: 'none', lineHeight: '18px' } }, '✓ 已保存 ' + savedAt) : null,
           h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', flex: 'none' } }, lineCount + ' 行'),
           h('button', { style: edBtnPrimary, onClick: save, disabled: busy || !loaded, title: '保存并刷新刀路 (⌘S)' }, busy ? '保存中…' : '保存'),
+          h('button', { style: edBtnGhost, onClick: viewToolpath, disabled: busy, title: '查看该 NC 文件对应的刀路' }, '查看刀路'),
           h('button', { style: edBtnDanger, onClick: onClose, title: '返回刀路视图' }, '返回')),
         err ? h('div', { style: { padding: '8px 14px', color: 'var(--dsw-alias-state-error-primary, #dc2626)', fontSize: 12, borderBottom: '1px solid var(--dsw-alias-border-l1, #eceff3)' } }, '错误：' + err) : null,
         h('textarea', {
@@ -758,7 +778,11 @@ window.__ModuleLoader__.load({
           h('button', { style: HANDLE_LEFT, onClick: () => setOpen(false), title: '收起面板', 'aria-label': '收起面板' },
             h(Chevron, { dir: 'right', size: 14 })),
           editingFile
-            ? h(NcEditorBoundary, null, h(NcEditor, { file: editingFile, sessionId, version: editVersion, onClose: () => { setEditingFile(null); load(); loadFiles(); } }))
+            ? h(NcEditorBoundary, null, h(NcEditor, {
+              file: editingFile, sessionId, version: editVersion,
+              onClose: () => { setEditingFile(null); load(); loadFiles(); },
+              onViewToolpath: () => { setEditingFile(null); loadNc(editingFile); },
+            }))
             : h(React.Fragment, null,
           h('div', { style: { padding: '10px 12px 6px', borderBottom: '1px solid var(--dsw-alias-border-l1, #eceff3)' } },
             h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 } },
