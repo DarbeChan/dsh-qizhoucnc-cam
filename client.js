@@ -7,6 +7,9 @@ window.__ModuleLoader__.load({
     // （ConversationController.input = InputHub）。立即加载时序下 apply 阶段该服务可能尚未就绪。
     let appCtx = null;
 
+    // feature 4 跳板事件：右栏 tab 挂载后，把「打开 NC」转发给浮动面板（QizhouCNC_CAM 编辑界面）
+    const OPEN_NC_EVENT = 'dsh-cam:open-nc';
+
     // ============ dsh-resource://file 地址解码（与 DSH docpreview 同源语义） ============
     // 会话中蓝色文件名点击 → openFile → sidebarRight.openResource(dsh-resource://file/session/<id>/<path>)
     // 本插件注册更高优先级(extension)的 tab 类型接管 .nc/.cnc/.gcode，解码地址后在本插件编辑器打开。
@@ -429,13 +432,24 @@ window.__ModuleLoader__.load({
         return resolveWorkspacePath(cwd || '', parsed.path);
       }, [parsed, cwd]);
 
+      // 点击会话中的 NC 文件名时：不要在本 tab 内打开编辑器，而是转发给浮动面板
+      // （QizhouCNC_CAM 编辑界面）打开——这样「查看刀路/返回」能回到真正的刀路视图。
+      React.useEffect(() => {
+        if (file) {
+          try {
+            if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent(OPEN_NC_EVENT, { detail: { file } }));
+          } catch (e) { /* ignore */ }
+          const t = setTimeout(() => { try { if (actions && typeof actions.close === 'function') actions.close(); } catch (e) { /* ignore */ } }, 0);
+          return () => clearTimeout(t);
+        }
+      }, [file, actions]);
+
       if (!parsed || !file) {
         return h('div', { style: { padding: 16, color: 'var(--dsw-alias-label-secondary, #6b7280)', fontSize: 13 } },
           '无法解析该 NC 文件地址');
       }
-      const closeTab = () => { try { if (actions && typeof actions.close === 'function') actions.close(); } catch (e) { /* ignore */ } };
-      return h(NcEditorBoundary, null,
-        h(NcEditor, { file, sessionId, version: 0, onClose: closeTab }));
+      return h('div', { style: { padding: 16, color: 'var(--dsw-alias-label-secondary, #6b7280)', fontSize: 13 } },
+        '正在 QizhouCNC_CAM 中打开：' + basenameOf(file));
     }
 
     // ============ floating panel ============
@@ -657,6 +671,19 @@ window.__ModuleLoader__.load({
       }, [modelFile, post, load, loadFiles]);
 
       const ncCount = files.nc.length;
+
+      // feature 4: 右栏 tab 转发「打开 NC」→ 浮动面板进入编辑界面（并展开面板）
+      React.useEffect(() => {
+        if (typeof window === 'undefined') return;
+        const onOpenNc = (e) => {
+          const p = e && e.detail && typeof e.detail.file === 'string' ? e.detail.file : null;
+          if (!p) return;
+          setOpen(true);
+          setEditingFile(p);
+        };
+        window.addEventListener(OPEN_NC_EVENT, onOpenNc);
+        return () => window.removeEventListener(OPEN_NC_EVENT, onOpenNc);
+      }, []);
 
       // feature 1: clicking anywhere outside the panel collapses it to the right sidebar
       React.useEffect(() => {
