@@ -364,6 +364,8 @@ window.__ModuleLoader__.load({
 
       // 直接跳转到该 NC 文件对应的刀路视图（等价于「返回」+ 单击该文件名，不保存、不进入保存中状态）
       const viewToolpath = () => {
+        // 兜底清除可能卡住的 busy 状态（此前版本曾因保存卡住导致按钮禁用）
+        setBusy(false); setErr(null);
         if (typeof onViewToolpath === 'function') onViewToolpath();
         else if (typeof onClose === 'function') onClose();
       };
@@ -382,7 +384,7 @@ window.__ModuleLoader__.load({
           savedAt ? h('span', { style: { fontSize: 12, fontWeight: 600, color: '#ffffff', background: '#16a34a', padding: '2px 10px', borderRadius: 10, flex: 'none', lineHeight: '18px' } }, '✓ 已保存 ' + savedAt) : null,
           h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', flex: 'none' } }, lineCount + ' 行'),
           h('button', { style: edBtnPrimary, onClick: save, disabled: busy || !loaded, title: '保存并刷新刀路 (⌘S)' }, busy ? '保存中…' : '保存'),
-          h('button', { style: edBtnGhost, onClick: viewToolpath, disabled: busy, title: '查看该 NC 文件对应的刀路' }, '查看刀路'),
+          h('button', { style: edBtnGhost, onClick: viewToolpath, title: '查看该 NC 文件对应的刀路' }, '查看刀路'),
           h('button', { style: edBtnDanger, onClick: onClose, title: '返回刀路视图' }, '返回')),
         err ? h('div', { style: { padding: '8px 14px', color: 'var(--dsw-alias-state-error-primary, #dc2626)', fontSize: 12, borderBottom: '1px solid var(--dsw-alias-border-l1, #eceff3)' } }, '错误：' + err) : null,
         h('textarea', {
