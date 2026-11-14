@@ -1,6 +1,6 @@
 {
   "name": "dsh-qizhoucnc-cam",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "description": "CNC program (NC/CNC/G-code) toolpath recognition, 3D toolpath + 3D STEP model viewport (face/edge machining-position annotation), and a large editing view with quote-to-composer, for DeepSeek Harness (DSH). Made by Chengdu Qizhou Machinery Technology Co., Ltd., for research and study only.",
   "type": "module",
   "license": "MIT",

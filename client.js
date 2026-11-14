@@ -252,9 +252,10 @@ window.__ModuleLoader__.load({
     // scene 来自 /dsh-cam/model：{ bounds:{min,max}, faces:[{id,vertices,triangles,center,area}], edges:[{id,points}] }
     // selected: { kind:'face'|'edge', id } | null；点击面/边时回传 onSelect。
     // pivot: [x,y,z] 旋转轴心；默认取模型包围盒中心。旋转/缩放都围绕该点。
-    function ModelViewer3D({ scene, selected, onSelect, pivot, features }) {
+    function ModelViewer3D({ scene, selected, onSelect, onAnnotate, pivot, features }) {
       const [view, setView] = React.useState(null);
       const drag = React.useRef(null);
+      const suppressClick = React.useRef(false);
       const W = 600, H = 460, cx = W / 2, cy = H / 2;
       const pv = pivot || [0, 0, 0];
       // 已标注特征：kind+refId → feature 记录（用于橙色高亮）
@@ -345,8 +346,8 @@ window.__ModuleLoader__.load({
             style: { cursor: 'pointer' },
             onMouseEnter: (e) => { if (!isSel && !isFeat) e.currentTarget.setAttribute('fill', FACE_HOVER); },
             onMouseLeave: (e) => { if (!isSel && !isFeat) e.currentTarget.setAttribute('fill', FACE_FILL); },
-            onClick: (e) => { e.stopPropagation(); onSelect({ kind: 'face', id: f.id, center: f.center, area: f.area }); },
-            onDoubleClick: (e) => { e.stopPropagation(); onSelect({ kind: 'face', id: f.id, center: f.center, area: f.area }); },
+            onClick: clickGuard(() => onSelect({ kind: 'face', id: f.id, center: f.center, area: f.area })),
+            onDoubleClick: clickGuard(() => onAnnotate({ kind: 'face', id: f.id, center: f.center, area: f.area })),
           }));
         }
       }
@@ -365,28 +366,45 @@ window.__ModuleLoader__.load({
           strokeWidth: isFeat ? 3.2 : (isSel ? 3 : 1.4),
           strokeLinejoin: 'round', strokeLinecap: 'round',
           style: { cursor: 'pointer' },
-          onClick: (ev) => { ev.stopPropagation(); onSelect({ kind: 'edge', id: e.id, points: e.points }); },
-          onDoubleClick: (ev) => { ev.stopPropagation(); onSelect({ kind: 'edge', id: e.id, points: e.points }); },
+          onClick: clickGuard(() => onSelect({ kind: 'edge', id: e.id, points: e.points })),
+          onDoubleClick: clickGuard(() => onAnnotate({ kind: 'edge', id: e.id, points: e.points })),
         }));
       }
 
       const onPointerDown = (e) => {
         if (e.button !== 0 && e.button !== 1 && e.button !== 2) return;
-        e.currentTarget.setPointerCapture(e.pointerId);
+        suppressClick.current = false;
         drag.current = {
           x: e.clientX, y: e.clientY,
           yaw: view.yaw, pitch: view.pitch, panX: view.panX, panY: view.panY,
           mode: (e.button === 2 || e.shiftKey) ? 'pan' : 'rotate',
+          moved: false,
         };
+        const move = (ev) => {
+          const d = drag.current; if (!d) return;
+          const dx = ev.clientX - d.x, dy = ev.clientY - d.y;
+          if (!d.moved && Math.abs(dx) + Math.abs(dy) > 3) d.moved = true;
+          if (!d.moved) return;
+          suppressClick.current = true;
+          if (d.mode === 'pan') setView((v) => ({ ...v, panX: d.panX + dx, panY: d.panY + dy }));
+          else setView((v) => ({ ...v, yaw: d.yaw + dx * 0.01, pitch: Math.max(-Math.PI / 2, Math.min(Math.PI / 2, d.pitch + dy * 0.01)) }));
+        };
+        const up = () => {
+          drag.current = null;
+          window.removeEventListener('pointermove', move);
+          window.removeEventListener('pointerup', up);
+          window.removeEventListener('pointercancel', up);
+        };
+        window.addEventListener('pointermove', move);
+        window.addEventListener('pointerup', up);
+        window.addEventListener('pointercancel', up);
       };
-      const onPointerMove = (e) => {
-        const d = drag.current; if (!d) return;
-        const dx = e.clientX - d.x, dy = e.clientY - d.y;
-        if (d.mode === 'pan') setView((v) => ({ ...v, panX: d.panX + dx, panY: d.panY + dy }));
-        else setView((v) => ({ ...v, yaw: d.yaw + dx * 0.01, pitch: Math.max(-Math.PI / 2, Math.min(Math.PI / 2, d.pitch + dy * 0.01)) }));
-      };
-      const onPointerUp = () => { drag.current = null; };
       const onWheel = (e) => { e.preventDefault(); setView((v) => ({ ...v, zoom: Math.max(0.05, Math.min(20, v.zoom * (e.deltaY < 0 ? 1.12 : 0.9))) })); };
+      const clickGuard = (fn) => (e) => {
+        e.stopPropagation();
+        if (suppressClick.current) { suppressClick.current = false; return; }
+        fn();
+      };
 
       const applyView = (v) => setView((cur) => fitView(v.yaw, v.pitch));
       const viewBtn = (v, active) => h('button', {
@@ -401,8 +419,8 @@ window.__ModuleLoader__.load({
       const activeView = VIEWS.find((v) => Math.abs(v.yaw - view.yaw) < 1e-6 && Math.abs(v.pitch - view.pitch) < 1e-6);
 
       const selText = selected
-        ? (selected.kind === 'face' ? '已选面 #' + selected.id + (selected.area ? ' · ' + Math.round(selected.area) + ' mm²' : '') : '已选边 #' + selected.id)
-        : '点击模型的面或边线，标注加工位置';
+        ? (selected.kind === 'face' ? '已选面 #' + selected.id + (selected.area ? ' · ' + Math.round(selected.area) + ' mm²' : '') : '已选边 #' + selected.id) + '（双击标注）'
+        : '单击选中面或边线，双击标注加工位置';
 
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minHeight: 0 } },
         h('div', { style: { display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' } },
@@ -412,8 +430,7 @@ window.__ModuleLoader__.load({
         h('svg', {
           viewBox: '0 0 ' + W + ' ' + H, width: '100%', height: '100%',
           style: { background: 'var(--dsw-alias-bg-base, #fff)', borderRadius: 8, border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', touchAction: 'none', cursor: 'grab', flex: 1, minHeight: 0 },
-          onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp,
-          onWheel, onContextMenu: (e) => e.preventDefault(),
+          onPointerDown, onWheel, onContextMenu: (e) => e.preventDefault(),
           onMouseDown: (e) => { if (e.target === e.currentTarget) onSelect(null); },
         },
           gridLines.map((g, i) => line(g, 'var(--dsw-alias-border-l1, #e5e7eb)', 0.5)),
@@ -704,6 +721,7 @@ window.__ModuleLoader__.load({
       const [viewMode, setViewMode] = React.useState('toolpath'); // 'toolpath' | 'model'
       const [modelScene, setModelScene] = React.useState(null);
       const [modelSelected, setModelSelected] = React.useState(null); // { kind, id, center?, area?, points? }
+      const [annotating, setAnnotating] = React.useState(false); // 双击后进入标注命名态（显示命名输入框）
       const [modelLoading, setModelLoading] = React.useState(false);
       const [modelFeatures, setModelFeatures] = React.useState([]);
       const [featureName, setFeatureName] = React.useState('');
@@ -864,6 +882,7 @@ window.__ModuleLoader__.load({
             if (d && d.ok && Array.isArray(d.faces)) {
               setModelScene(d);
               setModelSelected(null);
+              setAnnotating(false);
               setViewMode('model');
               setModelFile(p);
               loadFeatures(p);
@@ -1139,7 +1158,11 @@ window.__ModuleLoader__.load({
                       : h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', textAlign: 'center', padding: '12px 0' } }, '暂无标注\n双击面/边线添加')),
                   // 右侧：模型视窗 + 轴心 + 标注输入
                   h('div', { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' } },
-                    h(ModelViewer3D, { scene: modelScene, selected: modelSelected, onSelect: setModelSelected, pivot: modelPivot, features: modelFeatures }),
+                    h(ModelViewer3D, {
+                      scene: modelScene, selected: modelSelected, pivot: modelPivot, features: modelFeatures,
+                      onSelect: (sel) => { setModelSelected(sel); setAnnotating(false); },
+                      onAnnotate: (sel) => { setModelSelected(sel); setAnnotating(true); },
+                    }),
                     h('div', { style: { display: 'flex', gap: 6, alignItems: 'center', marginTop: 6 } },
                       h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, '旋转轴心'),
                       h('button', {
@@ -1162,7 +1185,7 @@ window.__ModuleLoader__.load({
                         ? h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } },
                             '当前 (' + modelPivot.map((v) => Math.round(v)).join(', ') + ')')
                         : null),
-                    modelSelected
+                    modelSelected && annotating
                       ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, padding: 8, marginTop: 6, borderRadius: 8, background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)', border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)' } },
                           h('div', { style: { fontSize: 11, fontWeight: 600, color: 'var(--dsw-alias-label-primary, #111)' } },
                             (modelSelected.kind === 'face' ? '标注加工面' : '标注加工边线') + ' · 已选 #' + modelSelected.id),
@@ -1171,7 +1194,7 @@ window.__ModuleLoader__.load({
                             h('input', { style: input, value: featureNote, placeholder: '备注（可选，如钻孔/铣面）', onChange: (e) => setFeatureNote(e.target.value), onKeyDown: (e) => { if (e.key === 'Enter') addFeature(); } })),
                           h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
                             h('button', { style: btnPrimary, onClick: addFeature, disabled: busy }, '写入识别文件'),
-                            h('button', { style: btn, onClick: () => setModelSelected(null) }, '取消')))
+                            h('button', { style: btn, onClick: () => { setModelSelected(null); setAnnotating(false); } }, '取消')))
                       : null))
               : h(Viewer3D, { data })),
           // 打赏 footer（左下角）
@@ -1219,13 +1242,18 @@ window.__ModuleLoader__.load({
                   onClick: (e) => e.stopPropagation(),
                 },
                   h('div', { style: { fontSize: 15, fontWeight: 700, color: 'var(--dsw-alias-label-primary, #111)' } }, '制作不易，打赏随心'),
-                  h('div', { style: { textAlign: 'center', fontSize: 12, lineHeight: '20px', color: 'var(--dsw-alias-label-secondary, #6b7280)', padding: '0 4px' } },
-                    '莫愁前路无知己，天下谁人不识君。'),
-                  h('div', { style: { textAlign: 'center', fontSize: 12, lineHeight: '20px', color: 'var(--dsw-alias-label-secondary, #6b7280)', padding: '0 4px' } },
-                    '起舟扬帆难不畏，越是当下最好时。'),
+                  h('div', {
+                    style: {
+                      textAlign: 'center', fontSize: 13.5, lineHeight: '24px', color: '#92400e',
+                      background: 'linear-gradient(135deg, #fef3c7, #fde68a)', borderRadius: 10,
+                      padding: '10px 14px', fontWeight: 600, letterSpacing: '0.5px',
+                      boxShadow: 'inset 0 0 0 1px rgba(217,119,6,0.25)',
+                    },
+                  },
+                    '莫愁前路无知己，天下谁人不识君。', h('br', null), '起舟扬帆难不畏，越是当下最好时。'),
                   h('img', { src: '/dsh-cam/qrcode', alt: '微信收款二维码', style: { width: 224, height: 'auto', borderRadius: 8, display: 'block' } }),
-                  h('div', { style: { fontSize: 12, fontWeight: 600, color: '#d97706' } }, '微信扫码 · 支持鼓励一下'),
-                  h('div', { style: { textAlign: 'center', fontSize: 11, lineHeight: '16px', color: 'var(--dsw-alias-label-tertiary, #9ca3af)', padding: '0 6px' } },
+                  h('div', { style: { fontSize: 13, fontWeight: 700, color: '#d97706' } }, '微信扫码 · 支持鼓励一下'),
+                  h('div', { style: { textAlign: 'center', fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-secondary, #6b7280)', padding: '0 6px' } },
                     '如果觉得对你有帮助，打赏一下，让我知道帮助到了又一个同道中人。'),
                   h('button', { onClick: () => setShowReward(false), style: { ...btn, fontSize: 12 } }, '关闭')))
             : null,
