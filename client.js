@@ -698,6 +698,8 @@ window.__ModuleLoader__.load({
       const [featureNote, setFeatureNote] = React.useState('');
       // 模型视窗的旋转轴心（默认为 null → 用模型包围盒中心）；用户可设自定义轴心
       const [modelPivot, setModelPivot] = React.useState(null);
+      // 打赏二维码弹窗
+      const [showReward, setShowReward] = React.useState(false);
       const panelRef = React.useRef(null);
       // 可拖拽调节的面板宽度（像素），持久化到 localStorage
       const [panelWidth, setPanelWidth] = React.useState(() => {
@@ -846,14 +848,15 @@ window.__ModuleLoader__.load({
         setBusy(true); setErr(null); setModelLoading(true);
         post('/dsh-cam/model', { model: p })
           .then((d) => {
-            if (d.ok && d.scene) {
-              setModelScene(d.scene);
+            // /dsh-cam/model returns the tessellated scene directly ({ok,file,bounds,faces,edges})
+            if (d && d.ok && Array.isArray(d.faces)) {
+              setModelScene(d);
               setModelSelected(null);
               setViewMode('model');
               setModelFile(p);
               loadFeatures(p);
             } else {
-              setErr(d.error || '模型加载失败');
+              setErr((d && d.error) || '模型加载失败');
             }
           })
           .catch((e) => setErr(String(e)))
@@ -1155,6 +1158,44 @@ window.__ModuleLoader__.load({
                             h('span', { style: { flex: 1, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, f.note || '')))))
                     : null)
               : h(Viewer3D, { data })),
+          // 打赏 footer（左下角）
+          h('div', {
+            style: {
+              padding: '6px 12px 8px', borderTop: '1px solid var(--dsw-alias-border-l1, #eceff3)',
+              display: 'flex', alignItems: 'center', gap: 6,
+            },
+          },
+            h('button', {
+              onClick: () => setShowReward(true),
+              style: {
+                ...btn, fontSize: 11, padding: '3px 10px', border: 'none',
+                background: 'transparent', color: 'var(--dsw-alias-label-tertiary, #9ca3af)',
+                cursor: 'pointer',
+              },
+            }, '如果帮助到您，可打赏支持鼓励一下')),
+          // 打赏二维码弹窗
+          showReward
+            ? h('div', {
+                style: {
+                  position: 'fixed', inset: 0, zIndex: 3000,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  background: 'rgba(15, 23, 42, 0.5)',
+                },
+                onClick: () => setShowReward(false),
+              },
+                h('div', {
+                  style: {
+                    background: 'var(--dsw-alias-bg-base, #fff)', borderRadius: 14, padding: '18px 20px 16px',
+                    boxShadow: '0 20px 60px rgba(0,0,0,0.3)', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10,
+                    maxWidth: 'min(320px, 86vw)',
+                  },
+                  onClick: (e) => e.stopPropagation(),
+                },
+                  h('div', { style: { fontSize: 14, fontWeight: 600, color: 'var(--dsw-alias-label-primary, #111)' } }, '感谢支持'),
+                  h('img', { src: '/dsh-cam/qrcode', alt: '微信收款二维码', style: { width: 240, height: 'auto', borderRadius: 8, display: 'block' } }),
+                  h('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, '微信扫码，支持鼓励一下'),
+                  h('button', { onClick: () => setShowReward(false), style: { ...btn, fontSize: 12 } }, '关闭')))
+            : null,
         )));
     }
 

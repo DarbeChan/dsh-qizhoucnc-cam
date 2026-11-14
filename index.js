@@ -465,6 +465,21 @@ export function apply(ctx, config = {}) {
       },
     }));
 
+    // WeChat reward QR code (static PNG served from the plugin package)
+    routeDisposers.push(server.register({
+      kind: 'prefix',
+      path: '/dsh-cam/qrcode',
+      handler: async (req, res) => {
+        try {
+          const png = readFileSync(join(__dirname, 'qrcode.png'));
+          res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'public, max-age=86400', 'content-length': png.length });
+          res.end(png);
+        } catch (e) {
+          send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 404);
+        }
+      },
+    }));
+
     // NC files this session's model has modified, for a quick jump (feature 3).
     routeDisposers.push(server.register({
       kind: 'prefix',

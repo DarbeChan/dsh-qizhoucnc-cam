@@ -2,6 +2,18 @@
 
 本文件记录 DSH-QizhouCNC_CAM 的各版本变更。
 
+## [1.3.1] - 2026-11-14
+
+### 修复 (Fixed)
+
+- **模型视窗加载失败**：`/dsh-cam/model` 路由返回的是扁平 scene（`{ok,file,bounds,faces,edges}`，无 `scene` 字段），但 client 判断 `d.ok && d.scene` 导致永远走失败分支。改为判断 `d.ok && Array.isArray(d.faces)`。
+
+### 新增 (Added)
+
+- **打赏支持**：大窗口左下角新增「如果帮助到您，可打赏支持鼓励一下」，点击弹出微信收款二维码（`/dsh-cam/qrcode`，二维码 `qrcode.png` 已随包发布）。
+
+---
+
 ## [1.3.0] - 2026-11-14
 
 ### 新增 (Added)
