@@ -252,7 +252,7 @@ window.__ModuleLoader__.load({
     // scene 来自 /dsh-cam/model：{ bounds:{min,max}, faces:[{id,vertices,triangles,center,area}], edges:[{id,points}] }
     // selected: { kind:'face'|'edge', id } | null；点击面/边时回传 onSelect。
     // pivot: [x,y,z] 旋转轴心；默认取模型包围盒中心。旋转/缩放都围绕该点。
-    function ModelViewer3D({ scene, selected, onSelect, onAnnotate, pivot, features }) {
+    function ModelViewer3D({ scene, selected, onSelect, onAnnotate, pivot, features, locate }) {
       const [view, setView] = React.useState(null);
       const drag = React.useRef(null);
       const suppressClick = React.useRef(false);
@@ -328,6 +328,46 @@ window.__ModuleLoader__.load({
       const EDGE_COLOR = '#64748b';
       const EDGE_SELECTED = '#ff9a3d';
       const FEAT_FILL = 'rgba(255,154,61,0.72)'; // 已标注特征：橙色高亮
+      const LOCATE_FILL = 'rgba(34,197,94,0.85)'; // 点击标签定位：亮绿高亮
+      const LOCATE_STROKE = '#16a34a';
+
+      // 点击左侧标注列表某条 → 定位到模型对应面/边并高亮
+      const locateKey = locate ? (locate.kind + ':' + locate.id) : null;
+
+      // 必须在 face/edge 渲染循环之前声明（const 存在 TDZ，循环里已引用它）。
+      // 单击面/边 = 选择；双击 = 标注。拖拽后抑制 click，避免误触发。
+      const clickGuard = (fn) => (e) => {
+        e.stopPropagation();
+        if (suppressClick.current) { suppressClick.current = false; return; }
+        fn();
+      };
+
+      // 光照着色：按面法向做朗伯明暗（Lambert），让每个面有明暗层次，立体感强、
+      // 与浅色/深色背景都能区分开，避免纯色与背景融合。
+      const LIGHT = (() => { const l = [0.42, 0.36, 0.83]; const m = Math.hypot(l[0], l[1], l[2]); return [l[0] / m, l[1] / m, l[2] / m]; })();
+      const rotateDir = (p, yaw, pitch) => {
+        const [x, y, z] = p;
+        const cy = Math.cos(yaw), sy = Math.sin(yaw);
+        const x1 = x * cy - y * sy, y1 = x * sy + y * cy;
+        const cp = Math.cos(pitch), sp = Math.sin(pitch);
+        return [x1, y1 * cp + z * sp, -y1 * sp + z * cp];
+      };
+      const faceNormal = (f) => {
+        for (const tri of f.triangles) {
+          const a = f.vertices[tri[0]], b = f.vertices[tri[1]], c = f.vertices[tri[2]];
+          const nx = (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]);
+          const ny = (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]);
+          const nz = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+          const len = Math.hypot(nx, ny, nz);
+          if (len > 1e-9) return [nx / len, ny / len, nz / len];
+        }
+        return [0, 0, 1];
+      };
+      const shadeOf = (n) => {
+        const rn = rotateDir(n, view.yaw, view.pitch);
+        const nd = rn[0] * LIGHT[0] + rn[1] * LIGHT[1] + rn[2] * LIGHT[2];
+        return 0.34 + 0.66 * Math.max(0, nd);
+      };
 
       // faces → ONE <path> per face (merge all its triangles into a single path).
       // 每个三角形若独立成 <polygon>，复杂 STEP 会有上万 DOM 节点导致崩溃；
@@ -336,25 +376,29 @@ window.__ModuleLoader__.load({
       for (const f of scene.faces) {
         const isSel = selected && selected.kind === 'face' && selected.id === f.id;
         const isFeat = featMap['face:' + f.id];
+        const isLoc = locateKey === 'face:' + f.id;
+        const shade = shadeOf(faceNormal(f));
+        const r = Math.round(96 * shade), g = Math.round(116 * shade), b = Math.round(140 * shade);
+        const baseFill = 'rgb(' + r + ',' + g + ',' + b + ')';
+        const hoverFill = 'rgb(' + Math.min(255, r + 42) + ',' + Math.min(255, g + 42) + ',' + Math.min(255, b + 42) + ')';
+        const fillColor = isLoc ? LOCATE_FILL : (isFeat ? FEAT_FILL : (isSel ? FACE_SELECTED : baseFill));
         let d = '';
-        let p0 = null;
         for (const tri of f.triangles) {
           const a = f.vertices[tri[0]], b = f.vertices[tri[1]], c = f.vertices[tri[2]];
           const [ax, ay] = toScreen(a), [bx, by] = toScreen(b), [cx2, cy2] = toScreen(c);
           d += 'M' + ax.toFixed(1) + ' ' + ay.toFixed(1)
              + 'L' + bx.toFixed(1) + ' ' + by.toFixed(1)
              + 'L' + cx2.toFixed(1) + ' ' + cy2.toFixed(1) + 'Z';
-          if (p0 === null) p0 = [ax, ay];
         }
         faceEls.push(h('path', {
           key: 'f' + f.id,
           d,
-          fill: isFeat ? FEAT_FILL : (isSel ? FACE_SELECTED : FACE_FILL),
-          stroke: isFeat ? '#f97316' : (isSel ? '#f97316' : FACE_STROKE),
-          strokeWidth: isFeat ? 0.8 : 0.4, strokeLinejoin: 'round',
+          fill: fillColor,
+          stroke: isLoc ? LOCATE_STROKE : (isFeat ? '#f97316' : (isSel ? '#f97316' : FACE_STROKE)),
+          strokeWidth: isLoc ? 2.4 : (isFeat ? 0.8 : 0.4), strokeLinejoin: 'round',
           style: { cursor: 'pointer' },
-          onMouseEnter: (e) => { if (!isSel && !isFeat) e.currentTarget.setAttribute('fill', FACE_HOVER); },
-          onMouseLeave: (e) => { if (!isSel && !isFeat) e.currentTarget.setAttribute('fill', FACE_FILL); },
+          onMouseEnter: (e) => { if (!isSel && !isFeat && !isLoc) e.currentTarget.setAttribute('fill', hoverFill); },
+          onMouseLeave: (e) => { if (!isSel && !isFeat && !isLoc) e.currentTarget.setAttribute('fill', baseFill); },
           onClick: clickGuard(() => onSelect({ kind: 'face', id: f.id, center: f.center, area: f.area })),
           onDoubleClick: clickGuard(() => onAnnotate({ kind: 'face', id: f.id, center: f.center, area: f.area })),
         }));
@@ -364,14 +408,15 @@ window.__ModuleLoader__.load({
       for (const e of scene.edges) {
         const isSel = selected && selected.kind === 'edge' && selected.id === e.id;
         const isFeat = featMap['edge:' + e.id];
+        const isLoc = locateKey === 'edge:' + e.id;
         let pts = '';
         e.points.forEach((p, j) => { const [sx, sy] = toScreen(p); pts += (j === 0 ? '' : ' ') + sx.toFixed(1) + ',' + sy.toFixed(1); });
         edgeEls.push(h('polyline', {
           key: 'e' + e.id,
           points: pts,
           fill: 'none',
-          stroke: isFeat ? '#f97316' : (isSel ? EDGE_SELECTED : EDGE_COLOR),
-          strokeWidth: isFeat ? 3.2 : (isSel ? 3 : 1.4),
+          stroke: isLoc ? LOCATE_STROKE : (isFeat ? '#f97316' : (isSel ? EDGE_SELECTED : EDGE_COLOR)),
+          strokeWidth: isLoc ? 4.4 : (isFeat ? 3.2 : (isSel ? 3 : 1.4)),
           strokeLinejoin: 'round', strokeLinecap: 'round',
           style: { cursor: 'pointer' },
           onClick: clickGuard(() => onSelect({ kind: 'edge', id: e.id, points: e.points })),
@@ -408,11 +453,6 @@ window.__ModuleLoader__.load({
         window.addEventListener('pointercancel', up);
       };
       const onWheel = (e) => { e.preventDefault(); setView((v) => ({ ...v, zoom: Math.max(0.05, Math.min(20, v.zoom * (e.deltaY < 0 ? 1.12 : 0.9))) })); };
-      const clickGuard = (fn) => (e) => {
-        e.stopPropagation();
-        if (suppressClick.current) { suppressClick.current = false; return; }
-        fn();
-      };
 
       const applyView = (v) => setView((cur) => fitView(v.yaw, v.pitch));
       const viewBtn = (v, active) => h('button', {
@@ -706,7 +746,7 @@ window.__ModuleLoader__.load({
     };
     const btn = { display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 10px', fontSize: 12, cursor: 'pointer', borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', background: 'var(--dsw-alias-interactive-bg, transparent)', color: 'var(--dsw-alias-label-primary, #111)' };
     const btnPrimary = { display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 12px', fontSize: 12, cursor: 'pointer', fontWeight: 600, borderRadius: 6, border: '1px solid transparent', background: 'var(--dsw-alias-state-business-primary, #2563eb)', color: '#fff' };
-    const input = { flex: 1, minWidth: 0, padding: '5px 8px', fontSize: 12, border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', borderRadius: 6, background: 'var(--dsw-alias-surface, #fff)', color: 'var(--dsw-alias-label-primary, #111)' };
+    const input = { flex: 1, minWidth: 0, padding: '6px 10px', fontSize: 13, border: '1px solid #d1d5db', borderRadius: 6, background: '#ffffff', color: '#111827' };
 
     function ToolpathPanel({ useSessions }) {
       const [open, setOpen] = React.useState(true);
@@ -734,8 +774,12 @@ window.__ModuleLoader__.load({
       const [modelFeatures, setModelFeatures] = React.useState([]);
       const [featureName, setFeatureName] = React.useState('');
       const [featureNote, setFeatureNote] = React.useState('');
+      // 二次修改：正在编辑的标注 id（null=新建）；双击标注项进入重命名态
+      const [editingFeatureId, setEditingFeatureId] = React.useState(null);
       // 模型视窗的旋转轴心（默认为 null → 用模型包围盒中心）；用户可设自定义轴心
       const [modelPivot, setModelPivot] = React.useState(null);
+      // 点击左侧标注列表项 → 定位到模型对应面/边并高亮（{ kind, id }）
+      const [locateTarget, setLocateTarget] = React.useState(null);
       // 打赏二维码弹窗
       const [showReward, setShowReward] = React.useState(false);
       const panelRef = React.useRef(null);
@@ -916,23 +960,48 @@ window.__ModuleLoader__.load({
         const name = featureName.trim();
         if (!name) { setErr('请为这个加工位置填写名称'); return; }
         setBusy(true); setErr(null);
-        post('/dsh-cam/feature', {
+        const body = {
           model: modelFile,
           name,
           kind: modelSelected.kind,
           refId: modelSelected.id,
           note: featureNote.trim(),
-        })
+        };
+        // 二次修改：若正在编辑某条已有标注，走 update；否则新增
+        if (editingFeatureId) body.op = 'update', body.id = editingFeatureId;
+        post('/dsh-cam/feature', body)
           .then((d) => {
             if (d.ok && Array.isArray(d.features)) {
               setModelFeatures(d.features);
               setFeatureName('');
               setFeatureNote('');
+              setEditingFeatureId(null);
+              setAnnotating(false);
+              setModelSelected(null);
             } else setErr(d.error || '标注写入失败');
           })
           .catch((e) => setErr(String(e)))
           .finally(() => setBusy(false));
-      }, [post, modelFile, modelSelected, featureName, featureNote]);
+      }, [post, modelFile, modelSelected, featureName, featureNote, editingFeatureId]);
+
+      // 从已有标注列表开始「二次修改」（重命名 / 改备注 / 重选目标）
+      const startEditFeature = React.useCallback((f) => {
+        setModelSelected({ kind: f.kind, id: f.refId });
+        setFeatureName(f.name || '');
+        setFeatureNote(f.note || '');
+        setEditingFeatureId(f.id);
+        setAnnotating(true);
+      }, []);
+
+      // 删除一条已有标注
+      const removeFeature = React.useCallback((f) => {
+        if (!modelFile) return;
+        setBusy(true); setErr(null);
+        post('/dsh-cam/feature', { model: modelFile, op: 'delete', id: f.id })
+          .then((d) => { if (d.ok && Array.isArray(d.features)) setModelFeatures(d.features); else setErr(d.error || '删除失败'); })
+          .catch((e) => setErr(String(e)))
+          .finally(() => setBusy(false));
+      }, [post, modelFile]);
 
       const ncCount = files.nc.length;
 
@@ -1157,19 +1226,33 @@ window.__ModuleLoader__.load({
                       ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4, flex: 1, overflowY: 'auto' } },
                           modelFeatures.map((f) => h('div', {
                             key: f.id,
-                            style: { display: 'flex', alignItems: 'center', gap: 6, padding: '5px 7px', fontSize: 12, borderRadius: 6, background: 'rgba(255,154,61,0.14)', border: '1px solid rgba(249,115,22,0.35)' },
+                            title: '单击定位到模型 · 双击重命名 · 点击 ✕ 删除',
+                            style: { display: 'flex', alignItems: 'center', gap: 6, padding: '5px 7px', fontSize: 12, borderRadius: 6, background: 'rgba(255,154,61,0.14)', border: '1px solid rgba(249,115,22,0.35)', cursor: 'pointer' },
+                            onClick: () => setLocateTarget({ kind: f.kind, id: f.refId }),
+                            onDoubleClick: () => startEditFeature(f),
                           },
                             h('span', { style: { fontSize: 12, color: '#f97316' } }, f.kind === 'face' ? '▨' : '╱'),
                             h('div', { style: { display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1 } },
                               h('span', { style: { fontWeight: 600, color: 'var(--dsw-alias-label-primary, #111)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, f.name),
-                              h('span', { style: { fontSize: 10, color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, (f.kind === 'face' ? '面' : '边') + ' #' + f.refId + (f.note ? ' · ' + f.note : ''))))))
+                              h('span', { style: { fontSize: 10, color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, (f.kind === 'face' ? '面' : '边') + ' #' + f.refId + (f.note ? ' · ' + f.note : ''))),
+                            h('button', {
+                              onClick: () => removeFeature(f),
+                              title: '删除此标注',
+                              style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 16, height: 16, fontSize: 11, lineHeight: 1, cursor: 'pointer', borderRadius: '50%', border: 'none', background: 'transparent', color: '#f97316', padding: 0 },
+                            }, '✕'))))
                       : h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', textAlign: 'center', padding: '12px 0' } }, '暂无标注\n双击面/边线添加')),
                   // 右侧：模型视窗 + 轴心 + 标注输入
                   h('div', { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' } },
                     h(ModelViewer3D, {
-                      scene: modelScene, selected: modelSelected, pivot: modelPivot, features: modelFeatures,
+                      scene: modelScene, selected: modelSelected, pivot: modelPivot, features: modelFeatures, locate: locateTarget,
                       onSelect: (sel) => { setModelSelected(sel); setAnnotating(false); },
-                      onAnnotate: (sel) => { setModelSelected(sel); setAnnotating(true); },
+                      onAnnotate: (sel) => {
+                        setModelSelected(sel);
+                        setFeatureName('');
+                        setFeatureNote('');
+                        setEditingFeatureId(null);
+                        setAnnotating(true);
+                      },
                     }),
                     h('div', { style: { display: 'flex', gap: 6, alignItems: 'center', marginTop: 6 } },
                       h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, '旋转轴心'),
@@ -1196,13 +1279,13 @@ window.__ModuleLoader__.load({
                     modelSelected && annotating
                       ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, padding: 8, marginTop: 6, borderRadius: 8, background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)', border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)' } },
                           h('div', { style: { fontSize: 11, fontWeight: 600, color: 'var(--dsw-alias-label-primary, #111)' } },
-                            (modelSelected.kind === 'face' ? '标注加工面' : '标注加工边线') + ' · 已选 #' + modelSelected.id),
+                            (editingFeatureId ? '修改加工位置' : (modelSelected.kind === 'face' ? '标注加工面' : '标注加工边线')) + ' · 已选 #' + modelSelected.id),
                           h('div', { style: { display: 'flex', gap: 6 } },
                             h('input', { style: input, value: featureName, placeholder: '加工位置名称（必填）', onChange: (e) => setFeatureName(e.target.value), onKeyDown: (e) => { if (e.key === 'Enter') addFeature(); } }),
                             h('input', { style: input, value: featureNote, placeholder: '备注（可选，如钻孔/铣面）', onChange: (e) => setFeatureNote(e.target.value), onKeyDown: (e) => { if (e.key === 'Enter') addFeature(); } })),
                           h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
-                            h('button', { style: btnPrimary, onClick: addFeature, disabled: busy }, '写入识别文件'),
-                            h('button', { style: btn, onClick: () => { setModelSelected(null); setAnnotating(false); } }, '取消')))
+                            h('button', { style: btnPrimary, onClick: addFeature, disabled: busy }, editingFeatureId ? '保存修改' : '写入识别文件'),
+                            h('button', { style: btn, onClick: () => { setModelSelected(null); setAnnotating(false); setEditingFeatureId(null); } }, '取消')))
                       : null))
               : h(Viewer3D, { data })),
           // 打赏 footer（左下角）
@@ -1249,21 +1332,21 @@ window.__ModuleLoader__.load({
                   },
                   onClick: (e) => e.stopPropagation(),
                 },
-                  h('div', { style: { fontSize: 15, fontWeight: 700, color: 'var(--dsw-alias-label-primary, #111)' } }, '制作不易，打赏随心'),
+                  h('div', { style: { fontSize: 17, fontWeight: 700, color: '#1f2937', letterSpacing: '0.5px' } }, '制作不易，打赏随心'),
                   h('div', {
                     style: {
-                      textAlign: 'center', fontSize: 13.5, lineHeight: '24px', color: '#92400e',
+                      textAlign: 'center', fontSize: 14, lineHeight: '26px', color: '#92400e',
                       background: 'linear-gradient(135deg, #fef3c7, #fde68a)', borderRadius: 10,
-                      padding: '10px 14px', fontWeight: 600, letterSpacing: '0.5px',
+                      padding: '12px 16px', fontWeight: 600, letterSpacing: '1px',
                       boxShadow: 'inset 0 0 0 1px rgba(217,119,6,0.25)',
                     },
                   },
                     '莫愁前路无知己，天下谁人不识君。', h('br', null), '起舟扬帆难不畏，越是当下最好时。'),
-                  h('img', { src: '/dsh-cam/qrcode', alt: '微信收款二维码', style: { width: 224, height: 'auto', borderRadius: 8, display: 'block' } }),
-                  h('div', { style: { fontSize: 13, fontWeight: 700, color: '#d97706' } }, '微信扫码 · 支持鼓励一下'),
-                  h('div', { style: { textAlign: 'center', fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-secondary, #6b7280)', padding: '0 6px' } },
+                  h('img', { src: '/dsh-cam/qrcode', alt: '微信收款二维码', style: { width: 112, height: 'auto', borderRadius: 8, display: 'block' } }),
+                  h('div', { style: { fontSize: 15, fontWeight: 700, color: '#d97706', letterSpacing: '0.5px' } }, '微信扫码 · 支持鼓励一下'),
+                  h('div', { style: { textAlign: 'center', fontSize: 13, lineHeight: '20px', color: '#4b5563', padding: '0 8px' } },
                     '如果觉得对你有帮助，打赏一下，让我知道帮助到了又一个同道中人。'),
-                  h('button', { onClick: () => setShowReward(false), style: { ...btn, fontSize: 12 } }, '关闭')))
+                  h('button', { onClick: () => setShowReward(false), style: { ...btn, fontSize: 13, padding: '4px 16px' } }, '关闭')))
             : null,
         )));
     }
