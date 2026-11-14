@@ -329,27 +329,35 @@ window.__ModuleLoader__.load({
       const EDGE_SELECTED = '#ff9a3d';
       const FEAT_FILL = 'rgba(255,154,61,0.72)'; // 已标注特征：橙色高亮
 
-      // faces → triangles as individual <polygon> for picking
+      // faces → ONE <path> per face (merge all its triangles into a single path).
+      // 每个三角形若独立成 <polygon>，复杂 STEP 会有上万 DOM 节点导致崩溃；
+      // 合并成单 path 后，DOM 节点数 = 面数，性能与内存都安全。
       const faceEls = [];
       for (const f of scene.faces) {
         const isSel = selected && selected.kind === 'face' && selected.id === f.id;
         const isFeat = featMap['face:' + f.id];
+        let d = '';
+        let p0 = null;
         for (const tri of f.triangles) {
           const a = f.vertices[tri[0]], b = f.vertices[tri[1]], c = f.vertices[tri[2]];
           const [ax, ay] = toScreen(a), [bx, by] = toScreen(b), [cx2, cy2] = toScreen(c);
-          faceEls.push(h('polygon', {
-            key: 'f' + f.id + '_' + faceEls.length,
-            points: ax.toFixed(1) + ',' + ay.toFixed(1) + ' ' + bx.toFixed(1) + ',' + by.toFixed(1) + ' ' + cx2.toFixed(1) + ',' + cy2.toFixed(1),
-            fill: isFeat ? FEAT_FILL : (isSel ? FACE_SELECTED : FACE_FILL),
-            stroke: isFeat ? '#f97316' : (isSel ? '#f97316' : FACE_STROKE),
-            strokeWidth: isFeat ? 1 : 0.5, strokeLinejoin: 'round',
-            style: { cursor: 'pointer' },
-            onMouseEnter: (e) => { if (!isSel && !isFeat) e.currentTarget.setAttribute('fill', FACE_HOVER); },
-            onMouseLeave: (e) => { if (!isSel && !isFeat) e.currentTarget.setAttribute('fill', FACE_FILL); },
-            onClick: clickGuard(() => onSelect({ kind: 'face', id: f.id, center: f.center, area: f.area })),
-            onDoubleClick: clickGuard(() => onAnnotate({ kind: 'face', id: f.id, center: f.center, area: f.area })),
-          }));
+          d += 'M' + ax.toFixed(1) + ' ' + ay.toFixed(1)
+             + 'L' + bx.toFixed(1) + ' ' + by.toFixed(1)
+             + 'L' + cx2.toFixed(1) + ' ' + cy2.toFixed(1) + 'Z';
+          if (p0 === null) p0 = [ax, ay];
         }
+        faceEls.push(h('path', {
+          key: 'f' + f.id,
+          d,
+          fill: isFeat ? FEAT_FILL : (isSel ? FACE_SELECTED : FACE_FILL),
+          stroke: isFeat ? '#f97316' : (isSel ? '#f97316' : FACE_STROKE),
+          strokeWidth: isFeat ? 0.8 : 0.4, strokeLinejoin: 'round',
+          style: { cursor: 'pointer' },
+          onMouseEnter: (e) => { if (!isSel && !isFeat) e.currentTarget.setAttribute('fill', FACE_HOVER); },
+          onMouseLeave: (e) => { if (!isSel && !isFeat) e.currentTarget.setAttribute('fill', FACE_FILL); },
+          onClick: clickGuard(() => onSelect({ kind: 'face', id: f.id, center: f.center, area: f.area })),
+          onDoubleClick: clickGuard(() => onAnnotate({ kind: 'face', id: f.id, center: f.center, area: f.area })),
+        }));
       }
       // edges as individual <polyline> for picking
       const edgeEls = [];
