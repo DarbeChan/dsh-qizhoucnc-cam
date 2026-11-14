@@ -1,6 +1,6 @@
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync, rmdirSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname, basename, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,6 +9,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const FREECAD_BIN = '/Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd';
 const CAM_SCRIPT = join(__dirname, 'cam_script.py');
 const RENDER_SCRIPT = join(__dirname, 'toolpath_render.py');
+const MODEL_SCRIPT = join(__dirname, 'model_tessellate.py');
 const STATE_FILE = join(homedir(), '.dsh', 'storages', 'dsh-cam-toolpath.json');
 const WORKSPACE_STORE = join(homedir(), '.dsh', 'storages', 'workspace.json');
 
@@ -206,6 +207,75 @@ function scanFiles(rootDir, extRe, maxDepth = 5) {
   }
   walk(resolve(rootDir), 0);
   return [...seen.values()].sort((a, b) => b.mtime - a.mtime);
+}
+
+// ---- tessellate a STEP/BREP/IGES model into renderable faces + edges via FreeCAD ----
+const MODEL_EXT = /\.(step|stp|brep|iges|igs)$/i;
+const FEATURE_FILE = join(homedir(), '.dsh', 'storages', 'dsh-cam-features.json');
+
+function assertModelPath(modelPath) {
+  const p = resolvePath(modelPath);
+  if (!existsSync(p)) throw new Error('Model file not found: ' + p);
+  if (!MODEL_EXT.test(p)) throw new Error('Unsupported model type (allowed: .step/.stp/.brep/.iges/.igs): ' + p);
+  return p;
+}
+
+function tessellateModel(modelPath, opts = {}) {
+  const freecadBin = opts.freecadBin ?? FREECAD_BIN;
+  const p = assertModelPath(modelPath);
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-cam-model-'));
+  const outFile = join(tmp, 'model.json');
+  const env = {
+    ...process.env, LANG: 'en_US.UTF-8',
+    CAM_MODEL: p, CAM_MODEL_OUT: outFile,
+    CAM_TESS_TOL: String(opts.tol ?? 0.1),
+  };
+  const res = spawnSync(freecadBin, [MODEL_SCRIPT], { env, encoding: 'utf8', timeout: 180_000, maxBuffer: 256 * 1024 * 1024 });
+  if (res.error) throw res.error;
+  if (!existsSync(outFile)) {
+    const tail = (res.stderr || res.stdout || '').trim().split('\n').slice(-12).join('\n');
+    throw new Error('FreeCAD tessellation failed to produce model JSON.\n' + tail);
+  }
+  let scene;
+  try {
+    scene = JSON.parse(readFileSync(outFile, 'utf8'));
+  } catch (e) {
+    throw new Error('Invalid tessellation JSON: ' + (e && e.message ? e.message : e));
+  } finally {
+    try { unlinkSync(outFile); } catch { /* ignore */ }
+    try { rmdirSync(tmp); } catch { /* ignore */ }
+  }
+  if (!scene || scene.ok !== true) throw new Error('Tessellation failed: ' + (scene && scene.error ? scene.error : 'unknown'));
+  return scene;
+}
+
+// ---- read / append machining-position features (named face/edge annotations) ----
+function loadFeatures() {
+  try { return JSON.parse(readFileSync(FEATURE_FILE, 'utf8')) || {}; } catch { return {}; }
+}
+function saveFeatures(features) {
+  try {
+    mkdirSync(dirname(FEATURE_FILE), { recursive: true });
+    writeFileSync(FEATURE_FILE, JSON.stringify(features, null, 2), 'utf8');
+  } catch { /* ignore */ }
+}
+// append a named machining feature, keyed by model path; returns the updated list
+function appendFeature(modelPath, feature) {
+  const p = resolvePath(modelPath);
+  const all = loadFeatures();
+  const list = Array.isArray(all[p]) ? all[p] : [];
+  const item = {
+    id: feature.id ?? (Date.now().toString(36) + Math.random().toString(36).slice(2, 6)),
+    name: String(feature.name ?? '未命名'),
+    kind: feature.kind === 'edge' ? 'edge' : 'face',
+    refId: Number(feature.refId) || 0,
+    note: String(feature.note ?? ''),
+    createdAt: feature.createdAt ?? new Date().toISOString(),
+  };
+  list.push(item);
+  all[p] = list;
+  saveFeatures(all);
+  return list;
 }
 
 // ---- generate a G-code toolpath from a STEP/BREP/IGES model via FreeCAD CAM ----
@@ -406,6 +476,47 @@ export function apply(ctx, config = {}) {
           const seq = url.searchParams.get('seq');
           if (seq !== null) delete changedNcFiles[sessionParam || ''];
           send(res, { ok: true, session: sessionParam, files: (sessionParam && changedNcFiles[sessionParam]) || [], seq: seq ?? null });
+        } catch (e) {
+          send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
+        }
+      },
+    }));
+
+    // tessellate a STEP/BREP/IGES model into faces+edges for the 3D model viewport
+    routeDisposers.push(server.register({
+      kind: 'prefix',
+      path: '/dsh-cam/model',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { send(res, { ok: false, error: 'POST only' }, 405); return; }
+        const parsed = await readBody(req);
+        try {
+          const scene = tessellateModel(parsed.model, { freecadBin, tol: parsed.tol });
+          send(res, scene);
+        } catch (e) {
+          send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
+        }
+      },
+    }));
+
+    // read the machining-position features recorded for a model
+    routeDisposers.push(server.register({
+      kind: 'prefix',
+      path: '/dsh-cam/feature',
+      handler: async (req, res) => {
+        try {
+          const url = new URL(req.url ?? '/', 'http://localhost');
+          const model = url.searchParams.get('model');
+          if (req.method === 'POST') {
+            const parsed = await readBody(req);
+            const model = parsed.model ?? url.searchParams.get('model');
+            const list = appendFeature(model, parsed);
+            send(res, { ok: true, model: resolvePath(model), features: list });
+            return;
+          }
+          if (!model) { send(res, { ok: false, error: 'model query param required' }, 400); return; }
+          const all = loadFeatures();
+          const p = resolvePath(model);
+          send(res, { ok: true, model: p, features: Array.isArray(all[p]) ? all[p] : [] });
         } catch (e) {
           send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
         }

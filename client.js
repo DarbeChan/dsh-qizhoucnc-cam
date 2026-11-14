@@ -248,6 +248,173 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // ============ 3D 模型视窗（三角面渲染 + 选面/选边拾取 + 标注加工位置） ============
+    // scene 来自 /dsh-cam/model：{ bounds:{min,max}, faces:[{id,vertices,triangles,center,area}], edges:[{id,points}] }
+    // selected: { kind:'face'|'edge', id } | null；点击面/边时回传 onSelect。
+    // pivot: [x,y,z] 旋转轴心；默认取模型包围盒中心。旋转/缩放都围绕该点。
+    function ModelViewer3D({ scene, selected, onSelect, pivot }) {
+      const [view, setView] = React.useState(null);
+      const drag = React.useRef(null);
+      const W = 600, H = 460, cx = W / 2, cy = H / 2;
+      const pv = pivot || [0, 0, 0];
+
+      const toScreen = React.useCallback((p) => {
+        const [sx, sy] = project3d([p[0] - pv[0], p[1] - pv[1], p[2] - pv[2]], view.yaw, view.pitch);
+        return [cx + sx * view.zoom + view.panX, cy + sy * view.zoom + view.panY];
+      }, [view, pv[0], pv[1], pv[2]]);
+
+      // fit the whole model into the viewport for a given yaw/pitch (relative to pivot)
+      const fitView = React.useCallback((yaw, pitch) => {
+        const bb = scene && scene.bounds;
+        if (!bb) return { yaw, pitch, panX: 0, panY: 0, zoom: 1 };
+        const [x0, y0, z0] = bb.min, [x1, y1, z1] = bb.max;
+        const corners = [
+          [x0, y0, z0], [x1, y0, z0], [x0, y1, z0], [x1, y1, z0],
+          [x0, y0, z1], [x1, y0, z1], [x0, y1, z1], [x1, y1, z1],
+          [(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2],
+        ];
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const p of corners) {
+          const [sx, sy] = project3d([p[0] - pv[0], p[1] - pv[1], p[2] - pv[2]], yaw, pitch);
+          if (sx < minX) minX = sx; if (sx > maxX) maxX = sx;
+          if (sy < minY) minY = sy; if (sy > maxY) maxY = sy;
+        }
+        const w = maxX - minX, h = maxY - minY;
+        const zoom = Math.min((W - 40) / Math.max(1e-6, w), (H - 40) / Math.max(1e-6, h));
+        return { yaw, pitch, panX: 0, panY: 0, zoom: Math.max(0.05, Math.min(20, zoom)) };
+      }, [scene, pv[0], pv[1], pv[2]]);
+
+      // (re)fit when the scene changes
+      React.useEffect(() => { setView(fitView(0.7, 0.55)); }, [scene, fitView]);
+      if (!view || !scene) return h('div', { style: { flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--dsw-alias-label-tertiary, #9ca3af)', fontSize: 13 } }, '加载模型…');
+
+      const bb = scene.bounds;
+      const baseZ = pv[2];
+      const half = bb ? Math.max(bb.max[0] - bb.min[0], bb.max[1] - bb.min[1], bb.max[2] - bb.min[2]) / 2 : 50;
+      const R = Math.max(half * 1.4, 10);
+
+      const line = (pts, color, width, dash) => {
+        let d = '';
+        pts.forEach((p, j) => { const [sx, sy] = toScreen(p); d += (j === 0 ? 'M' : 'L') + sx.toFixed(1) + ' ' + sy.toFixed(1); });
+        return h('path', { d, fill: 'none', stroke: color, strokeWidth: width, strokeDasharray: dash, strokeLinejoin: 'round', strokeLinecap: 'round' });
+      };
+
+      // grid + axes (centered on the rotation pivot)
+      const step = Math.max(1, Math.round(R / 5));
+      const gridLines = [];
+      for (let v = -R; v <= R + 1e-9; v += step) {
+        gridLines.push([[pv[0] - R, pv[1] + v, baseZ], [pv[0] + R, pv[1] + v, baseZ]]);
+        gridLines.push([[pv[0] + v, pv[1] - R, baseZ], [pv[0] + v, pv[1] + R, baseZ]]);
+      }
+      const axLen = R * 1.1;
+      const axes = [
+        { pts: [pv, [pv[0] + axLen, pv[1], pv[2]]], color: 'var(--dsw-alias-state-error-primary, #ef4444)' },
+        { pts: [pv, [pv[0], pv[1] + axLen, pv[2]]], color: 'var(--dsw-alias-state-success-primary, #22c55e)' },
+        { pts: [pv, [pv[0], pv[1], pv[2] + axLen]], color: 'var(--dsw-alias-state-business-primary, #3b82f6)' },
+      ];
+
+      const FACE_FILL = '#c7d2e0';
+      const FACE_STROKE = 'rgba(30,41,59,0.10)';
+      const FACE_SELECTED = 'rgba(255,154,61,0.55)';
+      const FACE_HOVER = 'rgba(77,107,254,0.35)';
+      const EDGE_COLOR = '#64748b';
+      const EDGE_SELECTED = '#ff9a3d';
+
+      // faces → triangles as individual <polygon> for picking
+      const faceEls = [];
+      for (const f of scene.faces) {
+        const isSel = selected && selected.kind === 'face' && selected.id === f.id;
+        for (const tri of f.triangles) {
+          const a = f.vertices[tri[0]], b = f.vertices[tri[1]], c = f.vertices[tri[2]];
+          const [ax, ay] = toScreen(a), [bx, by] = toScreen(b), [cx2, cy2] = toScreen(c);
+          faceEls.push(h('polygon', {
+            key: 'f' + f.id + '_' + faceEls.length,
+            points: ax.toFixed(1) + ',' + ay.toFixed(1) + ' ' + bx.toFixed(1) + ',' + by.toFixed(1) + ' ' + cx2.toFixed(1) + ',' + cy2.toFixed(1),
+            fill: isSel ? FACE_SELECTED : FACE_FILL,
+            stroke: isSel ? '#f97316' : FACE_STROKE,
+            strokeWidth: 0.5, strokeLinejoin: 'round',
+            style: { cursor: 'pointer' },
+            onMouseEnter: (e) => { if (!isSel) e.currentTarget.setAttribute('fill', FACE_HOVER); },
+            onMouseLeave: (e) => { if (!isSel) e.currentTarget.setAttribute('fill', FACE_FILL); },
+            onClick: (e) => { e.stopPropagation(); onSelect({ kind: 'face', id: f.id, center: f.center, area: f.area }); },
+          }));
+        }
+      }
+      // edges as individual <polyline> for picking
+      const edgeEls = [];
+      for (const e of scene.edges) {
+        const isSel = selected && selected.kind === 'edge' && selected.id === e.id;
+        let pts = '';
+        e.points.forEach((p, j) => { const [sx, sy] = toScreen(p); pts += (j === 0 ? '' : ' ') + sx.toFixed(1) + ',' + sy.toFixed(1); });
+        edgeEls.push(h('polyline', {
+          key: 'e' + e.id,
+          points: pts,
+          fill: 'none',
+          stroke: isSel ? EDGE_SELECTED : EDGE_COLOR,
+          strokeWidth: isSel ? 3 : 1.4,
+          strokeLinejoin: 'round', strokeLinecap: 'round',
+          style: { cursor: 'pointer' },
+          onClick: (ev) => { ev.stopPropagation(); onSelect({ kind: 'edge', id: e.id, points: e.points }); },
+        }));
+      }
+
+      const onPointerDown = (e) => {
+        if (e.button !== 0 && e.button !== 1 && e.button !== 2) return;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        drag.current = {
+          x: e.clientX, y: e.clientY,
+          yaw: view.yaw, pitch: view.pitch, panX: view.panX, panY: view.panY,
+          mode: (e.button === 2 || e.shiftKey) ? 'pan' : 'rotate',
+        };
+      };
+      const onPointerMove = (e) => {
+        const d = drag.current; if (!d) return;
+        const dx = e.clientX - d.x, dy = e.clientY - d.y;
+        if (d.mode === 'pan') setView((v) => ({ ...v, panX: d.panX + dx, panY: d.panY + dy }));
+        else setView((v) => ({ ...v, yaw: d.yaw + dx * 0.01, pitch: Math.max(-Math.PI / 2, Math.min(Math.PI / 2, d.pitch + dy * 0.01)) }));
+      };
+      const onPointerUp = () => { drag.current = null; };
+      const onWheel = (e) => { e.preventDefault(); setView((v) => ({ ...v, zoom: Math.max(0.05, Math.min(20, v.zoom * (e.deltaY < 0 ? 1.12 : 0.9))) })); };
+
+      const applyView = (v) => setView((cur) => fitView(v.yaw, v.pitch));
+      const viewBtn = (v, active) => h('button', {
+        key: v.id, onClick: () => applyView(v), title: v.label + '视图',
+        style: {
+          padding: '1px 6px', fontSize: 11, cursor: 'pointer', borderRadius: 5,
+          border: '1px solid ' + (active ? 'var(--dsw-alias-state-business-primary, #2563eb)' : 'var(--dsw-alias-border-l1, #e5e7eb)'),
+          background: active ? 'color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 12%, transparent)' : 'transparent',
+          color: 'var(--dsw-alias-label-primary, #111)',
+        },
+      }, v.label);
+      const activeView = VIEWS.find((v) => Math.abs(v.yaw - view.yaw) < 1e-6 && Math.abs(v.pitch - view.pitch) < 1e-6);
+
+      const selText = selected
+        ? (selected.kind === 'face' ? '已选面 #' + selected.id + (selected.area ? ' · ' + Math.round(selected.area) + ' mm²' : '') : '已选边 #' + selected.id)
+        : '点击模型的面或边线，标注加工位置';
+
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minHeight: 0 } },
+        h('div', { style: { display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' } },
+          h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', marginRight: 2 } }, '视图'),
+          VIEWS.map((v) => viewBtn(v, activeView === v)),
+          h('button', { style: { marginLeft: 'auto', padding: '1px 8px', fontSize: 11, cursor: 'pointer', borderRadius: 5, border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', background: 'transparent', color: 'var(--dsw-alias-label-primary, #111)' }, onClick: () => setView(fitView(0.7, 0.55)), title: '重置视图并适配' }, '重置')),
+        h('svg', {
+          viewBox: '0 0 ' + W + ' ' + H, width: '100%', height: '100%',
+          style: { background: 'var(--dsw-alias-bg-base, #fff)', borderRadius: 8, border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', touchAction: 'none', cursor: 'grab', flex: 1, minHeight: 0 },
+          onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp,
+          onWheel, onContextMenu: (e) => e.preventDefault(),
+          onMouseDown: (e) => { if (e.target === e.currentTarget) onSelect(null); },
+        },
+          gridLines.map((g, i) => line(g, 'var(--dsw-alias-border-l1, #e5e7eb)', 0.5)),
+          axes.map((a, i) => line(a.pts, a.color, 1.2)),
+          h('g', null, faceEls),
+          h('g', null, edgeEls)),
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 } },
+          h('span', { style: { flex: 1, color: selected ? 'var(--dsw-alias-brand-primary, #2563eb)' : 'var(--dsw-alias-label-tertiary, #9ca3af)', fontWeight: selected ? 600 : 400 } }, selText),
+          h('span', { style: { color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } },
+            '拖拽=旋转 · Shift/右键=平移 · 滚轮=缩放 · 面 ' + scene.faces.length + ' · 边 ' + scene.edges.length)),
+      );
+    }
+
     // ============ NC 编辑器（大界面：预览 + 修改） ============
     const ED_HEAD = { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderBottom: '1px solid var(--dsw-alias-border-l1, #eceff3)' };
     const edBtn = { display: 'inline-flex', alignItems: 'center', gap: 4, padding: '4px 12px', fontSize: 12, cursor: 'pointer', fontWeight: 600, borderRadius: 6, border: '1px solid transparent' };
@@ -521,6 +688,16 @@ window.__ModuleLoader__.load({
       const [editVersion, setEditVersion] = React.useState(0);
       // feature 3: NC files the model just modified (surfaced for a quick jump)
       const [changedNc, setChangedNc] = React.useState([]);
+      // 模型视窗 / 刀路视窗切换 + 3D 模型 + 选面/选边标注
+      const [viewMode, setViewMode] = React.useState('toolpath'); // 'toolpath' | 'model'
+      const [modelScene, setModelScene] = React.useState(null);
+      const [modelSelected, setModelSelected] = React.useState(null); // { kind, id, center?, area?, points? }
+      const [modelLoading, setModelLoading] = React.useState(false);
+      const [modelFeatures, setModelFeatures] = React.useState([]);
+      const [featureName, setFeatureName] = React.useState('');
+      const [featureNote, setFeatureNote] = React.useState('');
+      // 模型视窗的旋转轴心（默认为 null → 用模型包围盒中心）；用户可设自定义轴心
+      const [modelPivot, setModelPivot] = React.useState(null);
       const panelRef = React.useRef(null);
       // 可拖拽调节的面板宽度（像素），持久化到 localStorage
       const [panelWidth, setPanelWidth] = React.useState(() => {
@@ -662,13 +839,58 @@ window.__ModuleLoader__.load({
           .finally(() => setBusy(false));
       }, [post, load, loadFiles]);
 
-      const generate = React.useCallback(() => {
-        if (!modelFile.trim()) { setErr('请先输入模型(.step/.stp)路径'); return; }
+      // 点击 STEP 模型 → 自动网格化并切到「模型视窗」显示
+      const loadModel = React.useCallback((modelPath) => {
+        const p = (modelPath || '').trim();
+        if (!p) { setErr('请先输入或选择一个 STEP 模型路径'); return; }
+        setBusy(true); setErr(null); setModelLoading(true);
+        post('/dsh-cam/model', { model: p })
+          .then((d) => {
+            if (d.ok && d.scene) {
+              setModelScene(d.scene);
+              setModelSelected(null);
+              setViewMode('model');
+              setModelFile(p);
+              loadFeatures(p);
+            } else {
+              setErr(d.error || '模型加载失败');
+            }
+          })
+          .catch((e) => setErr(String(e)))
+          .finally(() => { setBusy(false); setModelLoading(false); });
+      }, [post]);
+
+      // 拉取该模型已写入的「识别文件」标注
+      const loadFeatures = React.useCallback((modelPath) => {
+        fetch('/dsh-cam/feature?model=' + encodeURIComponent(modelPath))
+          .then((r) => r.json())
+          .then((d) => { if (d.ok && Array.isArray(d.features)) setModelFeatures(d.features); })
+          .catch(() => {});
+      }, []);
+
+      // 把当前选中的面/边作为「加工位置」标注，命名后写入识别文件
+      const addFeature = React.useCallback(() => {
+        if (!modelSelected) { setErr('请先在模型视窗中点击一个面或边线'); return; }
+        const name = featureName.trim();
+        if (!name) { setErr('请为这个加工位置填写名称'); return; }
         setBusy(true); setErr(null);
-        post('/dsh-cam/generate', { model: modelFile.trim() })
-          .then((d) => { if (d.ok) { load(); loadFiles(); } else setErr(d.error || '生成失败'); })
-          .catch((e) => setErr(String(e))).finally(() => setBusy(false));
-      }, [modelFile, post, load, loadFiles]);
+        post('/dsh-cam/feature', {
+          model: modelFile,
+          name,
+          kind: modelSelected.kind,
+          refId: modelSelected.id,
+          note: featureNote.trim(),
+        })
+          .then((d) => {
+            if (d.ok && Array.isArray(d.features)) {
+              setModelFeatures(d.features);
+              setFeatureName('');
+              setFeatureNote('');
+            } else setErr(d.error || '标注写入失败');
+          })
+          .catch((e) => setErr(String(e)))
+          .finally(() => setBusy(false));
+      }, [post, modelFile, modelSelected, featureName, featureNote]);
 
       const ncCount = files.nc.length;
 
@@ -764,7 +986,7 @@ window.__ModuleLoader__.load({
         style: { display: 'flex', alignItems: 'center', gap: 2, width: '100%', border: '1px solid transparent', borderRadius: 6 },
       },
         h('button', {
-          onClick: () => setModelFile(f.path),
+          onClick: () => loadModel(f.path),
           style: {
             display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0, textAlign: 'left',
             padding: '5px 8px', fontSize: 12, cursor: 'pointer',
@@ -854,16 +1076,85 @@ window.__ModuleLoader__.load({
                   }, listExpanded ? '收起 ▲' : '展开 ▼'))),
           h('div', { style: { padding: '8px 12px', borderBottom: '1px solid var(--dsw-alias-border-l1, #eceff3)' } },
             h('div', { style: { fontSize: 11, fontWeight: 600, color: 'var(--dsw-alias-label-secondary, #6b7280)', marginBottom: 6 } },
-              'STEP 模型' + (files.steps.length > 0 ? '（点击选择，自动填入并生成）' : '')),
+              'STEP 模型' + (files.steps.length > 0 ? '（点击查看，将在模型视窗显示。）' : '')),
             files.steps.length === 0
               ? h('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } }, '工作区未发现 .step/.stp 文件')
               : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 2, maxHeight: 90, overflow: 'auto' } }, stepItems),
             h('div', { style: { display: 'flex', gap: 6, marginTop: 8 } },
-              h('input', { style: input, value: modelFile, placeholder: '或手动输入 STEP 路径', onChange: (e) => setModelFile(e.target.value), onKeyDown: (e) => { if (e.key === 'Enter') generate(); } }),
-              h('button', { style: btnPrimary, onClick: generate, disabled: busy }, busy ? '生成中…' : '生成刀路'))),
+              h('input', { style: input, value: modelFile, placeholder: '或手动输入 STEP 路径', onChange: (e) => setModelFile(e.target.value), onKeyDown: (e) => { if (e.key === 'Enter') loadModel(modelFile); } }),
+              h('button', { style: btnPrimary, onClick: () => loadModel(modelFile), disabled: busy }, modelLoading ? '加载中…' : '加载模型'))),
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px 0' } },
+            h('button', {
+              onClick: () => setViewMode('toolpath'),
+              style: {
+                ...btn, fontWeight: viewMode === 'toolpath' ? 700 : 400,
+                borderColor: viewMode === 'toolpath' ? 'var(--dsw-alias-state-business-primary, #2563eb)' : 'var(--dsw-alias-border-l1, #e5e7eb)',
+                color: viewMode === 'toolpath' ? 'var(--dsw-alias-state-business-primary, #2563eb)' : 'var(--dsw-alias-label-primary, #111)',
+              },
+            }, '刀路视窗'),
+            h('button', {
+              onClick: () => setViewMode('model'),
+              style: {
+                ...btn, fontWeight: viewMode === 'model' ? 700 : 400,
+                borderColor: viewMode === 'model' ? 'var(--dsw-alias-state-business-primary, #2563eb)' : 'var(--dsw-alias-border-l1, #e5e7eb)',
+                color: viewMode === 'model' ? 'var(--dsw-alias-state-business-primary, #2563eb)' : 'var(--dsw-alias-label-primary, #111)',
+              },
+            }, '模型视窗'),
+            h('span', { style: { flex: 1 } }),
+            viewMode === 'model' && modelScene
+              ? h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } }, modelFile ? basenameOf(modelFile) : '') : null),
           h('div', { style: { flex: 1, overflow: 'hidden', padding: 10, display: 'flex', flexDirection: 'column', minHeight: 0 } },
             err ? h('div', { style: { padding: 8, color: 'var(--dsw-alias-state-error-primary, #dc2626)', fontSize: 12, marginBottom: 8 } }, '错误：' + err) : null,
-            h(Viewer3D, { data })),
+            viewMode === 'model'
+              ? h(React.Fragment, null,
+                  h(ModelViewer3D, { scene: modelScene, selected: modelSelected, onSelect: setModelSelected, pivot: modelPivot }),
+                  h('div', { style: { display: 'flex', gap: 6, alignItems: 'center', marginTop: 6 } },
+                    h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, '旋转轴心'),
+                    h('button', {
+                      onClick: () => setModelPivot(null),
+                      style: {
+                        ...btn, fontSize: 11, padding: '2px 8px',
+                        fontWeight: modelPivot === null ? 700 : 400,
+                        borderColor: modelPivot === null ? 'var(--dsw-alias-state-business-primary, #2563eb)' : 'var(--dsw-alias-border-l1, #e5e7eb)',
+                      },
+                    }, '包围盒中心'),
+                    h('button', {
+                      onClick: () => setModelPivot([0, 0, 0]),
+                      style: {
+                        ...btn, fontSize: 11, padding: '2px 8px',
+                        fontWeight: modelPivot && modelPivot[0] === 0 && modelPivot[1] === 0 && modelPivot[2] === 0 ? 700 : 400,
+                        borderColor: modelPivot && modelPivot[0] === 0 && modelPivot[1] === 0 && modelPivot[2] === 0 ? 'var(--dsw-alias-state-business-primary, #2563eb)' : 'var(--dsw-alias-border-l1, #e5e7eb)',
+                      },
+                    }, '原点 (0,0,0)'),
+                    modelPivot
+                      ? h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } },
+                          '当前 (' + modelPivot.map((v) => Math.round(v)).join(', ') + ')')
+                      : null),
+                  modelSelected
+                    ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, padding: 8, marginTop: 6, borderRadius: 8, background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)', border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)' } },
+                        h('div', { style: { fontSize: 11, fontWeight: 600, color: 'var(--dsw-alias-label-primary, #111)' } },
+                          (modelSelected.kind === 'face' ? '标注加工面' : '标注加工边线') + ' · 已选 #' + modelSelected.id),
+                        h('div', { style: { display: 'flex', gap: 6 } },
+                          h('input', { style: input, value: featureName, placeholder: '加工位置名称（必填）', onChange: (e) => setFeatureName(e.target.value), onKeyDown: (e) => { if (e.key === 'Enter') addFeature(); } }),
+                          h('input', { style: input, value: featureNote, placeholder: '备注（可选，如钻孔/铣面）', onChange: (e) => setFeatureNote(e.target.value), onKeyDown: (e) => { if (e.key === 'Enter') addFeature(); } })),
+                        h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+                          h('button', { style: btnPrimary, onClick: addFeature, disabled: busy }, '写入识别文件'),
+                          h('button', { style: btn, onClick: () => setModelSelected(null) }, '取消')))
+                    : null,
+                  modelFeatures.length > 0
+                    ? h('div', { style: { padding: '6px 0 0' } },
+                        h('div', { style: { fontSize: 11, fontWeight: 600, color: 'var(--dsw-alias-label-secondary, #6b7280)', marginBottom: 4 } }, '已标注加工位置（识别文件）'),
+                        h('div', { style: { display: 'flex', flexDirection: 'column', gap: 3, maxHeight: 120, overflow: 'auto' } },
+                          modelFeatures.map((f) => h('div', {
+                            key: f.id,
+                            style: { display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px', fontSize: 12, borderRadius: 5, background: 'var(--dsw-alias-bg-base, #fff)', border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)' },
+                          },
+                            h('span', { style: { fontSize: 12 } }, f.kind === 'face' ? '▨' : '╱'),
+                            h('span', { style: { fontWeight: 600, color: 'var(--dsw-alias-label-primary, #111)' } }, f.name),
+                            h('span', { style: { color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, (f.kind === 'face' ? '面' : '边') + ' #' + f.refId),
+                            h('span', { style: { flex: 1, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, f.note || '')))))
+                    : null)
+              : h(Viewer3D, { data })),
         )));
     }
 
