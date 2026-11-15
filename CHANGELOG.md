@@ -2,6 +2,14 @@
 
 本文件记录 DSH-QizhouCNC_CAM 的各版本变更。
 
+## [1.3.7] - 2026-11-15
+
+### 修复 (Fixed)
+
+- **FreeCAD 路径可配置 + 自动探测**：此前 FreeCAD 可执行文件路径硬编码为 macOS 的 `/Applications/FreeCAD.app/.../freecadcmd`，在未安装 FreeCAD 或其它系统的电脑上会报 `spawnSync ... freecadcmd ENOENT`。现改为：优先读插件设置 `freecadBin`，其次探测常见路径，找不到时给出明确的安装/配置提示（不再抛出令人困惑的 ENOENT）。
+
+---
+
 ## [1.3.6] - 2026-11-15
 
 ### 新增 (Added)

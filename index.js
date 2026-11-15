@@ -1,4 +1,5 @@
 import { defineTool } from '@deepseek-ai/dsh-tools';
+import z from '@deepseek-ai/schemastery';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync, rmdirSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
@@ -6,7 +7,16 @@ import { join, dirname, basename, isAbsolute, relative, resolve } from 'node:pat
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const FREECAD_BIN = '/Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd';
+// 默认 FreeCAD 路径（macOS）。其它机器可经插件设置覆盖 freecadBin。
+const FREECAD_BIN_DEFAULT = '/Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd';
+// 常见 FreeCAD 可执行文件位置（按顺序探测）。
+const FREECAD_BIN_CANDIDATES = [
+  '/Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd',
+  '/usr/bin/freecadcmd',
+  '/usr/local/bin/freecadcmd',
+  '/opt/freecad/bin/freecadcmd',
+  '/snap/bin/freecadcmd',
+];
 const CAM_SCRIPT = join(__dirname, 'cam_script.py');
 const RENDER_SCRIPT = join(__dirname, 'toolpath_render.py');
 const MODEL_SCRIPT = join(__dirname, 'model_tessellate.py');
@@ -70,6 +80,29 @@ function findPython() {
     if (probe.status === 0) return cmd;
   }
   return null;
+}
+
+// 解析 FreeCAD 可执行文件路径：优先插件设置 freecadBin，其次默认路径，最后按候选列表探测。
+function resolveFreecadBin(configured) {
+  if (typeof configured === 'string' && configured.trim()) {
+    if (existsSync(configured.trim())) return configured.trim();
+    return null; // 显式配置但不存在 → 报错提示，不用探测结果混淆
+  }
+  if (existsSync(FREECAD_BIN_DEFAULT)) return FREECAD_BIN_DEFAULT;
+  for (const cand of FREECAD_BIN_CANDIDATES) {
+    if (existsSync(cand)) return cand;
+  }
+  return null;
+}
+
+// 给出 FreeCAD 缺失时的友好错误（含安装指引）。
+function freecadMissingError(configured) {
+  if (typeof configured === 'string' && configured.trim()) {
+    return 'FreeCAD 可执行文件不存在：' + configured.trim() +
+      '\n请在插件设置里把「FreeCAD 路径」改成正确的 freecadcmd 绝对路径。';
+  }
+  return '找不到 FreeCAD（freecadcmd）。' +
+    '\n请安装 FreeCAD，或在插件设置里填写「FreeCAD 路径」指向 freecadcmd 可执行文件的绝对路径。';
 }
 
 // ---- persistence (survives restart) ----
@@ -222,7 +255,8 @@ function assertModelPath(modelPath) {
 }
 
 function tessellateModel(modelPath, opts = {}) {
-  const freecadBin = opts.freecadBin ?? FREECAD_BIN;
+  const freecadBin = resolveFreecadBin(opts.freecadBin);
+  if (!freecadBin) throw new Error(freecadMissingError(opts.freecadBin));
   const p = assertModelPath(modelPath);
   const tmp = mkdtempSync(join(tmpdir(), 'dsh-cam-model-'));
   const outFile = join(tmp, 'model.json');
@@ -382,7 +416,8 @@ function assetSceneOf(asset) {
 
 // ---- generate a G-code toolpath from a STEP/BREP/IGES model via FreeCAD CAM ----
 function generateToolpathFromModel(modelPath, opts = {}) {
-  const freecadBin = opts.freecadBin ?? FREECAD_BIN;
+  const freecadBin = resolveFreecadBin(opts.freecadBin);
+  if (!freecadBin) throw new Error(freecadMissingError(opts.freecadBin));
   const p = resolvePath(modelPath);
   if (!existsSync(p)) throw new Error('Model file not found: ' + p);
   // write the NC file next to the model, with the same base name (panda.step -> panda.nc)
@@ -410,8 +445,14 @@ function generateToolpathFromModel(modelPath, opts = {}) {
 export const name = 'dsh-cam';
 export const inject = ['tools', 'workspaceChanges'];
 
+// 插件设置：可覆盖 FreeCAD 可执行文件路径（其它机器 FreeCAD 不在默认位置时用）。
+export const Config = z.object({
+  freecadBin: z.string().description('FreeCAD freecadcmd 可执行文件的绝对路径；留空则自动探测。').default(''),
+}).loose();
+
 export function apply(ctx, config = {}) {
-  const freecadBin = config.freecadBin ?? FREECAD_BIN;
+  // 原始配置值；真正解析（含探测与友好报错）在 tessellateModel / generateToolpathFromModel 内按需进行。
+  const freecadBin = config.freecadBin;
 
   // restore persisted toolpath so the viewer is not empty after a restart
   latestToolpath = loadState();
