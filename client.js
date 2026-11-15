@@ -895,6 +895,9 @@ window.__ModuleLoader__.load({
       const [showReward, setShowReward] = React.useState(false);
       // 底部设置区（主体零件位移/旋转 + 夹具/毛坯）折叠/展开
       const [setupCollapsed, setSetupCollapsed] = React.useState(false);
+      // FreeCAD 自动下载状态（未安装 FreeCAD 时展示进度并触发下载）
+      const [fcStatus, setFcStatus] = React.useState(null); // { phase:'idle'|'downloading'|'extracting'|'done'|'error', ... }
+      const [fcChecking, setFcChecking] = React.useState(false);
       const panelRef = React.useRef(null);
       const assetFileRef = React.useRef(null); // 隐藏的 <input type=file>，用于原生「打开文件」对话框选择 STEP
       // 可拖拽调节的面板宽度（像素），持久化到 localStorage
@@ -998,6 +1001,9 @@ window.__ModuleLoader__.load({
         return () => clearInterval(t);
       }, [loadChangedNc]);
 
+      // 挂载时查询一次 FreeCAD 状态（未安装时展示下载入口）
+      React.useEffect(() => { checkFcStatus(); }, [checkFcStatus]);
+
       const post = React.useCallback((path, body) => fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).then((r) => r.json()), []);
 
       const reveal = React.useCallback((filePath) => {
@@ -1062,6 +1068,28 @@ window.__ModuleLoader__.load({
           .catch((e) => setErr(String(e)))
           .finally(() => { setBusy(false); setModelLoading(false); });
       }, [post]);
+
+      // 查询 FreeCAD 自动下载/安装状态
+      const checkFcStatus = React.useCallback(() => {
+        fetch('/dsh-cam/freecad').then((r) => r.json()).then((d) => {
+          if (d && d.ok) setFcStatus(d);
+        }).catch(() => {});
+      }, []);
+      // 触发 FreeCAD 自动下载（官方 GitHub Releases 便携版）
+      const startFcDownload = React.useCallback(() => {
+        setFcChecking(true);
+        post('/dsh-cam/freecad', {})
+          .then((d) => { if (d && d.ok) setFcStatus(d); })
+          .catch((e) => setErr(String(e)))
+          .finally(() => setFcChecking(false));
+      }, [post]);
+      // 下载中轮询进度
+      React.useEffect(() => {
+        if (fcStatus && fcStatus.phase === 'downloading') {
+          const t = setInterval(() => { fetch('/dsh-cam/freecad').then((r) => r.json()).then((d) => { if (d && d.ok) setFcStatus(d); }).catch(() => {}); }, 1500);
+          return () => clearInterval(t);
+        }
+      }, [fcStatus && fcStatus.phase]);
 
       // 拉取该模型已写入的「识别文件」标注
       const loadFeatures = React.useCallback((modelPath) => {
@@ -1433,7 +1461,34 @@ window.__ModuleLoader__.load({
               : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 2, maxHeight: 90, overflow: 'auto' } }, stepItems),
             h('div', { style: { display: 'flex', gap: 6, marginTop: 8 } },
               h('input', { style: input, value: modelFile, placeholder: '或手动输入 STEP 路径', onChange: (e) => setModelFile(e.target.value), onKeyDown: (e) => { if (e.key === 'Enter') loadModel(modelFile); } }),
-              h('button', { style: btnPrimary, onClick: () => loadModel(modelFile), disabled: busy }, modelLoading ? '加载中…' : '加载模型'))),
+              h('button', { style: btnPrimary, onClick: () => loadModel(modelFile), disabled: busy }, modelLoading ? '加载中…' : '加载模型')),
+            // FreeCAD 未安装时的自动下载入口（Windows / Linux 便携版）
+            fcStatus && fcStatus.found === false && fcStatus.phase !== 'downloading' && fcStatus.phase !== 'extracting' && fcStatus.phase !== 'done'
+              ? h('div', {
+                  style: {
+                    display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, padding: '8px 10px', borderRadius: 8,
+                    background: 'rgba(245,158,11,0.12)', border: '1px solid rgba(245,158,11,0.4)',
+                  },
+                },
+                  h('span', { style: { flex: 1, fontSize: 11, color: '#92400e' } },
+                    fcStatus.phase === 'error' ? 'FreeCAD 自动下载失败：' + (fcStatus.error || '未知错误') : '未检测到 FreeCAD，加载/生成需要它。'),
+                  fcStatus.phase === 'error'
+                    ? h('button', { style: btnPrimary, onClick: startFcDownload, disabled: fcChecking }, fcChecking ? '准备中…' : '重试下载')
+                    : h('button', { style: btnPrimary, onClick: startFcDownload, disabled: fcChecking }, fcChecking ? '准备中…' : '自动下载 FreeCAD'))
+              : null,
+            fcStatus && (fcStatus.phase === 'downloading' || fcStatus.phase === 'extracting')
+              ? h('div', {
+                  style: { display: 'flex', flexDirection: 'column', gap: 4, marginTop: 8, padding: '8px 10px', borderRadius: 8, background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)', border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)' },
+                },
+                  h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-primary, #111)' } }, fcStatus.phase === 'downloading' ? '正在下载 FreeCAD 便携版…' : '正在解压 FreeCAD…'),
+                  fcStatus.phase === 'downloading' && typeof fcStatus.total === 'number' && fcStatus.total > 0
+                    ? h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #6b7280)' } },
+                        Math.round(((fcStatus.downloaded || 0) / fcStatus.total) * 100) + '%（' + Math.round((fcStatus.downloaded || 0) / 1024 / 1024) + ' / ' + Math.round(fcStatus.total / 1024 / 1024) + ' MB）')
+                    : null)
+              : null,
+            fcStatus && fcStatus.phase === 'done' && fcStatus.bin
+              ? h('div', { style: { fontSize: 11, color: '#16a34a', marginTop: 6 } }, '✓ FreeCAD 已就绪：' + basenameOf(fcStatus.bin))
+              : null),
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px 0' } },
             h('button', {
               onClick: () => setViewMode('toolpath'),

@@ -5,6 +5,7 @@ import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, readdi
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname, basename, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ensureFreecadDownload, freecadInstallStatus, portableFreecadBin } from './freecad_install.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // 默认 FreeCAD 路径（macOS）。其它机器可经插件设置覆盖 freecadBin。
@@ -82,7 +83,7 @@ function findPython() {
   return null;
 }
 
-// 解析 FreeCAD 可执行文件路径：优先插件设置 freecadBin，其次默认路径，最后按候选列表探测。
+// 解析 FreeCAD 可执行文件路径：优先插件设置 freecadBin，其次默认路径，再按候选列表探测，最后 PATH / Spotlight 命令探测。
 function resolveFreecadBin(configured) {
   if (typeof configured === 'string' && configured.trim()) {
     if (existsSync(configured.trim())) return configured.trim();
@@ -91,6 +92,46 @@ function resolveFreecadBin(configured) {
   if (existsSync(FREECAD_BIN_DEFAULT)) return FREECAD_BIN_DEFAULT;
   for (const cand of FREECAD_BIN_CANDIDATES) {
     if (existsSync(cand)) return cand;
+  }
+  // 已自动下载的便携版 FreeCAD（Windows 7z 解压 / Linux AppImage 解压）
+  try {
+    const portable = portableFreecadBin();
+    if (portable && existsSync(portable)) return portable;
+  } catch { /* ignore */ }
+  // PATH 命令探测（which / where）
+  const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+  for (const cmd of ['freecadcmd', 'freecad']) {
+    try {
+      const probe = spawnSync(whichCmd, [cmd], { timeout: 6000, encoding: 'utf8' });
+      if (probe.status === 0 && probe.stdout) {
+        const first = probe.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+          .find((p) => existsSync(p));
+        if (first) return first;
+      }
+    } catch { /* try next */ }
+  }
+  // macOS Spotlight 全盘索引查找
+  if (process.platform === 'darwin') {
+    try {
+      const probe = spawnSync('mdfind', ['(kMDItemFSName == "freecadcmd") || (kMDItemFSName == "freecad")'], { timeout: 10000, encoding: 'utf8' });
+      if (probe.status === 0 && probe.stdout) {
+        const first = probe.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+          .find((p) => existsSync(p) && /freecad(cmd)?$/i.test(p));
+        if (first) return first;
+      }
+    } catch { /* ignore */ }
+  }
+  // Windows：扫描常见安装目录 Program Files 下的 FreeCAD* 版本目录
+  if (process.platform === 'win32') {
+    for (const root of ['C:\\Program Files', 'C:\\Program Files (x86)']) {
+      try {
+        for (const entry of readdirSync(root)) {
+          if (!/^freecad/i.test(entry)) continue;
+          const bin = join(root, entry, 'bin', 'freecadcmd.exe');
+          if (existsSync(bin)) return bin;
+        }
+      } catch { /* ignore */ }
+    }
   }
   return null;
 }
@@ -768,6 +809,24 @@ export function apply(ctx, config = {}) {
           const dest = join(dir, Date.now().toString(36) + '-' + name);
           writeFileSync(dest, buf);
           send(res, { ok: true, path: dest, name });
+        } catch (e) {
+          send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
+        }
+      },
+    }));
+
+    // FreeCAD 自动下载状态（供客户端展示进度 / 触发下载）
+    routeDisposers.push(server.register({
+      kind: 'prefix',
+      path: '/dsh-cam/freecad',
+      handler: async (req, res) => {
+        try {
+          if (req.method === 'POST') {
+            const st = ensureFreecadDownload();
+            send(res, { ok: true, found: !!resolveFreecadBin(freecadBin), ...st });
+            return;
+          }
+          send(res, { ok: true, found: !!resolveFreecadBin(freecadBin), ...freecadInstallStatus() });
         } catch (e) {
           send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
         }

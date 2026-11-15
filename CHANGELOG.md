@@ -2,6 +2,18 @@
 
 本文件记录 DSH-QizhouCNC_CAM 的各版本变更。
 
+## [1.3.8] - 2026-11-15
+
+### 新增 (Added)
+
+- **FreeCAD 自动下载**：当未安装 FreeCAD 时，插件可在模型视窗区一键下载官方便携版（Windows 7z 便携包 / Linux AppImage），下载后自动解压并识别 `freecadcmd` 位置，无需手动安装或填路径。macOS 暂不支持自动下载，仍走手动安装 / 填写 `freecadBin`。
+
+### 优化 (Improved)
+
+- FreeCAD 缺失提示更友好：区分「未安装」（引导自动下载）与「下载/解压失败」（可重试）。
+
+---
+
 ## [1.3.7] - 2026-11-15
 
 ### 修复 (Fixed)
