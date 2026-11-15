@@ -1080,9 +1080,9 @@ window.__ModuleLoader__.load({
           .catch((e) => setErr(String(e)))
           .finally(() => setFcChecking(false));
       }, [post]);
-      // 下载中轮询进度
+      // 下载中/中断恢复时轮询进度
       React.useEffect(() => {
-        if (fcStatus && fcStatus.phase === 'downloading') {
+        if (fcStatus && (fcStatus.phase === 'downloading' || fcStatus.phase === 'extracting' || fcStatus.phase === 'interrupted')) {
           const t = setInterval(() => { fetch('/dsh-cam/freecad').then((r) => r.json()).then((d) => { if (d && d.ok) setFcStatus(d); }).catch(() => {}); }, 1500);
           return () => clearInterval(t);
         }
@@ -1471,10 +1471,12 @@ window.__ModuleLoader__.load({
                   },
                 },
                   h('span', { style: { flex: 1, fontSize: 11, color: '#92400e' } },
-                    fcStatus.phase === 'error' ? 'FreeCAD 自动下载失败：' + (fcStatus.error || '未知错误') : '未检测到 FreeCAD，加载/生成需要它。'),
+                    fcStatus.phase === 'error' ? 'FreeCAD 自动下载失败：' + (fcStatus.error || '未知错误')
+                    : fcStatus.phase === 'interrupted' ? '下载已中断（已下载 ' + Math.round((fcStatus.downloaded || 0) / 1024 / 1024) + ' MB），可继续下载。'
+                    : '未检测到 FreeCAD，加载/生成需要它。'),
                   fcStatus.phase === 'error'
                     ? h('button', { style: btnPrimary, onClick: startFcDownload, disabled: fcChecking }, fcChecking ? '准备中…' : '重试下载')
-                    : h('button', { style: btnPrimary, onClick: startFcDownload, disabled: fcChecking }, fcChecking ? '准备中…' : '自动下载 FreeCAD'))
+                    : h('button', { style: btnPrimary, onClick: startFcDownload, disabled: fcChecking }, fcChecking ? '准备中…' : (fcStatus.phase === 'interrupted' ? '继续下载' : '自动下载 FreeCAD')))
               : null,
             fcStatus && (fcStatus.phase === 'downloading' || fcStatus.phase === 'extracting')
               ? h('div', {

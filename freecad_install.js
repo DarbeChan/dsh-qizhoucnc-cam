@@ -134,9 +134,8 @@ function downloadAsset(asset, dest, onChunk) {
       child.stderr.on('data', (d) => { errBuf += String(d); });
       child.on('exit', (code) => {
         if (code === 0) { resolve(dest); return; }
-        // 记录失败，回退下一个源
+        // 记录失败并回退下一个源。**不要删除 dest**：保留半截文件供 curl -C - 断点续传。
         if (idx + 1 < urls.length) {
-          try { unlinkSync(dest); } catch { /* ignore */ }
           tryUrl(idx + 1);
         } else {
           reject(new Error('下载失败：' + (errBuf.slice(-300) || ('exit ' + code))));
@@ -161,7 +160,10 @@ export function ensureFreecadDownload() {
   }
   mkdirSync(FREEACAD_DIR, { recursive: true });
   const dest = join(FREEACAD_DIR, asset.name);
-  setState({ phase: 'downloading', asset: asset.name, url: asset.url, dest, total: asset.size, downloaded: 0, error: null, bin: null });
+  // 保留已下载的半截文件，供 curl -C - 断点续传（意外中断后点「继续下载」）。
+  let existing = 0;
+  try { existing = statSync(dest).size; } catch { /* 无半截文件 */ }
+  setState({ phase: 'downloading', asset: asset.name, url: asset.url, dest, total: asset.size, downloaded: existing, error: null, bin: null });
   const running = { done: false };
   downloadJob = running;
   downloadAsset(asset, dest).then(() => {
@@ -186,10 +188,23 @@ export function ensureFreecadDownload() {
 // 下载进度：轮询 dest 文件大小，更新内存/磁盘态。
 export function freecadInstallStatus() {
   if (memoryState.phase === 'downloading' && memoryState.dest) {
-    try {
-      const st = statSync(memoryState.dest);
-      if (st.size !== memoryState.downloaded) setState({ downloaded: st.size });
-    } catch { /* file not created yet */ }
+    // 若后台下载进程已不在了（中断/重启），把状态修正为 interrupted，让前端显示「继续下载」按钮。
+    if (!downloadJob) {
+      let partial = 0;
+      try { partial = statSync(memoryState.dest).size; } catch { /* file not created */ }
+      if (partial > 0) {
+        memoryState = { ...memoryState, phase: 'interrupted', downloaded: partial };
+        saveState(memoryState);
+      } else {
+        memoryState = { ...memoryState, phase: 'idle', downloaded: 0 };
+        saveState(memoryState);
+      }
+    } else {
+      try {
+        const st = statSync(memoryState.dest);
+        if (st.size !== memoryState.downloaded) setState({ downloaded: st.size });
+      } catch { /* file not created yet */ }
+    }
   }
   return { ...memoryState, platform: platformKey(), supported: !!PLATFORM_ASSETS[platformKey()] && PLATFORM_ASSETS[platformKey()].kind !== 'dmg' };
 }
