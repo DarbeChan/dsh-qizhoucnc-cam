@@ -1001,9 +1001,6 @@ window.__ModuleLoader__.load({
         return () => clearInterval(t);
       }, [loadChangedNc]);
 
-      // 挂载时查询一次 FreeCAD 状态（未安装时展示下载入口）
-      React.useEffect(() => { checkFcStatus(); }, [checkFcStatus]);
-
       const post = React.useCallback((path, body) => fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).then((r) => r.json()), []);
 
       const reveal = React.useCallback((filePath) => {
@@ -1090,6 +1087,9 @@ window.__ModuleLoader__.load({
           return () => clearInterval(t);
         }
       }, [fcStatus && fcStatus.phase]);
+
+      // 挂载时查询一次 FreeCAD 状态（未安装时展示下载入口）
+      React.useEffect(() => { checkFcStatus(); }, [checkFcStatus]);
 
       // 拉取该模型已写入的「识别文件」标注
       const loadFeatures = React.useCallback((modelPath) => {
