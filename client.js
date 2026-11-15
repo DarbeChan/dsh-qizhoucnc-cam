@@ -55,6 +55,24 @@ window.__ModuleLoader__.load({
       return [x1, -y2]; // screen: X right, Y up (CNC Z-up)
     }
 
+    // 夹具/毛坯位姿：对点先绕 Z/Y/X 旋转（度），再平移（mm）。
+    function applyAssetTransform(p, t) {
+      if (!t) return p;
+      const tr = t.translate || [0, 0, 0];
+      const rt = t.rotate || [0, 0, 0];
+      let [x, y, z] = p;
+      // 绕 Z
+      const rz = (rt[2] || 0) * Math.PI / 180;
+      if (rz) { const c = Math.cos(rz), s = Math.sin(rz); const nx = x * c - y * s; const ny = x * s + y * c; x = nx; y = ny; }
+      // 绕 Y
+      const ry = (rt[1] || 0) * Math.PI / 180;
+      if (ry) { const c = Math.cos(ry), s = Math.sin(ry); const nx = x * c + z * s; const nz = -x * s + z * c; x = nx; z = nz; }
+      // 绕 X
+      const rx = (rt[0] || 0) * Math.PI / 180;
+      if (rx) { const c = Math.cos(rx), s = Math.sin(rx); const ny = y * c - z * s; const nz = y * s + z * c; y = ny; z = nz; }
+      return [x + (tr[0] || 0), y + (tr[1] || 0), z + (tr[2] || 0)];
+    }
+
     // six standard views + isometric default
     const VIEWS = [
       { id: 'iso', label: '等轴', yaw: 0.7, pitch: 0.55 },
@@ -252,12 +270,17 @@ window.__ModuleLoader__.load({
     // scene 来自 /dsh-cam/model：{ bounds:{min,max}, faces:[{id,vertices,triangles,center,area}], edges:[{id,points}] }
     // selected: { kind:'face'|'edge', id } | null；点击面/边时回传 onSelect。
     // pivot: [x,y,z] 旋转轴心；默认取模型包围盒中心。旋转/缩放都围绕该点。
-    function ModelViewer3D({ scene, selected, onSelect, onAnnotate, pivot, features, locate }) {
+    function ModelViewer3D({ scene, selected, onSelect, onAnnotate, pivot, features, locate, overlays, transform }) {
       const [view, setView] = React.useState(null);
       const drag = React.useRef(null);
-      const suppressClick = React.useRef(false);
+      // 单击/双击判定：记录上次点击的目标与时间（同目标 350ms 内再次点击 = 双击标注）
+      const clickState = React.useRef({ time: 0, kind: null, id: null });
+      const clickTimer = React.useRef(null);
       const W = 600, H = 460, cx = W / 2, cy = H / 2;
       const pv = pivot || [0, 0, 0];
+      // 主体模型的位移/旋转（与夹具/毛坯同款 transform）：{ translate:[x,y,z], rotate:[rx,ry,rz] }
+      const xf = transform || null;
+      const tpv = xf ? applyAssetTransform(pv, xf) : pv;
       // 已标注特征：kind+refId → feature 记录（用于橙色高亮）
       const featureKey = (f) => f.kind + ':' + f.refId;
       const featMap = React.useMemo(() => {
@@ -267,9 +290,10 @@ window.__ModuleLoader__.load({
       }, [features]);
 
       const toScreen = React.useCallback((p) => {
-        const [sx, sy] = project3d([p[0] - pv[0], p[1] - pv[1], p[2] - pv[2]], view.yaw, view.pitch);
+        const q = xf ? applyAssetTransform(p, xf) : p;
+        const [sx, sy] = project3d([q[0] - tpv[0], q[1] - tpv[1], q[2] - tpv[2]], view.yaw, view.pitch);
         return [cx + sx * view.zoom + view.panX, cy + sy * view.zoom + view.panY];
-      }, [view, pv[0], pv[1], pv[2]]);
+      }, [view, tpv[0], tpv[1], tpv[2], xf]);
 
       // fit the whole model into the viewport for a given yaw/pitch (relative to pivot)
       const fitView = React.useCallback((yaw, pitch) => {
@@ -283,14 +307,15 @@ window.__ModuleLoader__.load({
         ];
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
         for (const p of corners) {
-          const [sx, sy] = project3d([p[0] - pv[0], p[1] - pv[1], p[2] - pv[2]], yaw, pitch);
+          const q = xf ? applyAssetTransform(p, xf) : p;
+          const [sx, sy] = project3d([q[0] - tpv[0], q[1] - tpv[1], q[2] - tpv[2]], yaw, pitch);
           if (sx < minX) minX = sx; if (sx > maxX) maxX = sx;
           if (sy < minY) minY = sy; if (sy > maxY) maxY = sy;
         }
         const w = maxX - minX, h = maxY - minY;
         const zoom = Math.min((W - 40) / Math.max(1e-6, w), (H - 40) / Math.max(1e-6, h));
         return { yaw, pitch, panX: 0, panY: 0, zoom: Math.max(0.05, Math.min(20, zoom)) };
-      }, [scene, pv[0], pv[1], pv[2]]);
+      }, [scene, tpv[0], tpv[1], tpv[2], xf]);
 
       // (re)fit when the scene changes
       React.useEffect(() => { setView(fitView(0.7, 0.55)); }, [scene, fitView]);
@@ -333,14 +358,6 @@ window.__ModuleLoader__.load({
 
       // 点击左侧标注列表某条 → 定位到模型对应面/边并高亮
       const locateKey = locate ? (locate.kind + ':' + locate.id) : null;
-
-      // 必须在 face/edge 渲染循环之前声明（const 存在 TDZ，循环里已引用它）。
-      // 单击面/边 = 选择；双击 = 标注。拖拽后抑制 click，避免误触发。
-      const clickGuard = (fn) => (e) => {
-        e.stopPropagation();
-        if (suppressClick.current) { suppressClick.current = false; return; }
-        fn();
-      };
 
       // 光照着色：按面法向做朗伯明暗（Lambert），让每个面有明暗层次，立体感强、
       // 与浅色/深色背景都能区分开，避免纯色与背景融合。
@@ -397,10 +414,9 @@ window.__ModuleLoader__.load({
           stroke: isLoc ? LOCATE_STROKE : (isFeat ? '#f97316' : (isSel ? '#f97316' : FACE_STROKE)),
           strokeWidth: isLoc ? 2.4 : (isFeat ? 0.8 : 0.4), strokeLinejoin: 'round',
           style: { cursor: 'pointer' },
+          'data-hit': 'face', 'data-id': f.id,
           onMouseEnter: (e) => { if (!isSel && !isFeat && !isLoc) e.currentTarget.setAttribute('fill', hoverFill); },
           onMouseLeave: (e) => { if (!isSel && !isFeat && !isLoc) e.currentTarget.setAttribute('fill', baseFill); },
-          onClick: clickGuard(() => onSelect({ kind: 'face', id: f.id, center: f.center, area: f.area })),
-          onDoubleClick: clickGuard(() => onAnnotate({ kind: 'face', id: f.id, center: f.center, area: f.area })),
         }));
       }
       // edges as individual <polyline> for picking
@@ -419,38 +435,120 @@ window.__ModuleLoader__.load({
           strokeWidth: isLoc ? 4.4 : (isFeat ? 3.2 : (isSel ? 3 : 1.4)),
           strokeLinejoin: 'round', strokeLinecap: 'round',
           style: { cursor: 'pointer' },
-          onClick: clickGuard(() => onSelect({ kind: 'edge', id: e.id, points: e.points })),
-          onDoubleClick: clickGuard(() => onAnnotate({ kind: 'edge', id: e.id, points: e.points })),
+          'data-hit': 'edge', 'data-id': e.id,
         }));
       }
 
+      // ---- overlays (夹具/毛坯): render extra models with role-tinted colors, NOT pickable ----
+      const overlayEls = [];
+      const ROLE_COLORS = {
+        fixture: { face: 'rgba(99,102,241,0.30)', stroke: 'rgba(79,70,229,0.85)', edge: 'rgba(129,140,248,0.95)' },
+        blank: { face: 'rgba(16,185,129,0.22)', stroke: 'rgba(5,150,105,0.85)', edge: 'rgba(52,211,153,0.95)' },
+      };
+      for (const ov of (overlays || [])) {
+        const oscene = ov && ov.scene;
+        if (!oscene || !Array.isArray(oscene.faces)) continue;
+        const rc = ROLE_COLORS[ov.asset && ov.asset.role] || ROLE_COLORS.blank;
+        const xf = ov.asset && ov.asset.transform ? ov.asset.transform : null;
+        // faces: one path per face (semi-transparent role tint), with transform applied
+        for (const f of oscene.faces) {
+          let d = '';
+          for (const tri of f.triangles) {
+            const a = applyAssetTransform(f.vertices[tri[0]], xf), b = applyAssetTransform(f.vertices[tri[1]], xf), c = applyAssetTransform(f.vertices[tri[2]], xf);
+            const [ax, ay] = toScreen(a), [bx, by] = toScreen(b), [cx2, cy2] = toScreen(c);
+            d += 'M' + ax.toFixed(1) + ' ' + ay.toFixed(1) + 'L' + bx.toFixed(1) + ' ' + by.toFixed(1) + 'L' + cx2.toFixed(1) + ' ' + cy2.toFixed(1) + 'Z';
+          }
+          overlayEls.push(h('path', {
+            key: 'ov-' + ov.asset.id + '-f' + f.id,
+            d, fill: rc.face, stroke: rc.stroke, strokeWidth: 0.4, strokeLinejoin: 'round',
+            pointerEvents: 'none',
+          }));
+        }
+        // edges
+        for (const e of oscene.edges) {
+          let pts = '';
+          e.points.forEach((p, j) => { const q = applyAssetTransform(p, xf); const [sx, sy] = toScreen(q); pts += (j === 0 ? '' : ' ') + sx.toFixed(1) + ',' + sy.toFixed(1); });
+          overlayEls.push(h('polyline', {
+            key: 'ov-' + ov.asset.id + '-e' + e.id,
+            points: pts, fill: 'none', stroke: rc.edge, strokeWidth: 1.2,
+            strokeLinejoin: 'round', strokeLinecap: 'round', pointerEvents: 'none',
+          }));
+        }
+      }
+
+      // 命中测试：从指针下的元素向上找带 data-hit 的面/边（渲染时已给每个 path/polyline 打 data-hit/data-id）。
+      const hitTest = (clientX, clientY) => {
+        if (typeof document === 'undefined') return null;
+        let node = document.elementFromPoint(clientX, clientY);
+        while (node && node !== document.body && node !== document.documentElement) {
+          const hk = node.getAttribute && node.getAttribute('data-hit');
+          if (hk === 'face' || hk === 'edge') {
+            const id = Number(node.getAttribute('data-id'));
+            return { kind: hk, id };
+          }
+          node = node.parentNode;
+        }
+        return null;
+      };
+      // 单击/双击：同一面/边 350ms 内两次点击 = 双击（标注），否则单击（选中）。
+      const fireClick = (hit) => {
+        if (!hit) return;
+        const now = Date.now();
+        const prev = clickState.current;
+        if (prev && prev.kind === hit.kind && prev.id === hit.id && (now - prev.time) < 350) {
+          clearTimeout(clickTimer.current);
+          clickState.current = { time: 0, kind: null, id: null };
+          if (hit.kind === 'face') {
+            const f = scene.faces.find((x) => x.id === hit.id);
+            if (f) onAnnotate({ kind: 'face', id: f.id, center: f.center, area: f.area });
+          } else {
+            const ed = scene.edges.find((x) => x.id === hit.id);
+            if (ed) onAnnotate({ kind: 'edge', id: ed.id, points: ed.points });
+          }
+          return;
+        }
+        clickState.current = { time: now, kind: hit.kind, id: hit.id };
+        clearTimeout(clickTimer.current);
+        clickTimer.current = setTimeout(() => {
+          clickState.current = { time: 0, kind: null, id: null };
+          if (hit.kind === 'face') {
+            const f = scene.faces.find((x) => x.id === hit.id);
+            if (f) onSelect({ kind: 'face', id: f.id, center: f.center, area: f.area });
+          } else {
+            const ed = scene.edges.find((x) => x.id === hit.id);
+            if (ed) onSelect({ kind: 'edge', id: ed.id, points: ed.points });
+          }
+        }, 350);
+      };
+
+      // 用与刀路 Viewer3D 相同的 setPointerCapture 拖拽模式：可靠旋转/平移（Electron 下最稳）。
       const onPointerDown = (e) => {
         if (e.button !== 0 && e.button !== 1 && e.button !== 2) return;
-        suppressClick.current = false;
+        e.preventDefault();
+        e.currentTarget.setPointerCapture(e.pointerId);
         drag.current = {
           x: e.clientX, y: e.clientY,
           yaw: view.yaw, pitch: view.pitch, panX: view.panX, panY: view.panY,
           mode: (e.button === 2 || e.shiftKey) ? 'pan' : 'rotate',
           moved: false,
         };
-        const move = (ev) => {
-          const d = drag.current; if (!d) return;
-          const dx = ev.clientX - d.x, dy = ev.clientY - d.y;
-          if (!d.moved && Math.abs(dx) + Math.abs(dy) > 3) d.moved = true;
-          if (!d.moved) return;
-          suppressClick.current = true;
-          if (d.mode === 'pan') setView((v) => ({ ...v, panX: d.panX + dx, panY: d.panY + dy }));
-          else setView((v) => ({ ...v, yaw: d.yaw + dx * 0.01, pitch: Math.max(-Math.PI / 2, Math.min(Math.PI / 2, d.pitch + dy * 0.01)) }));
-        };
-        const up = () => {
-          drag.current = null;
-          window.removeEventListener('pointermove', move);
-          window.removeEventListener('pointerup', up);
-          window.removeEventListener('pointercancel', up);
-        };
-        window.addEventListener('pointermove', move);
-        window.addEventListener('pointerup', up);
-        window.addEventListener('pointercancel', up);
+      };
+      const onPointerMove = (e) => {
+        const d = drag.current;
+        if (!d) return;
+        const dx = e.clientX - d.x, dy = e.clientY - d.y;
+        if (!d.moved && Math.abs(dx) + Math.abs(dy) > 3) d.moved = true;
+        if (!d.moved) return;
+        if (d.mode === 'pan') setView((v) => ({ ...v, panX: d.panX + dx, panY: d.panY + dy }));
+        else setView((v) => ({ ...v, yaw: d.yaw + dx * 0.01, pitch: Math.max(-Math.PI / 2, Math.min(Math.PI / 2, d.pitch + dy * 0.01)) }));
+      };
+      const onPointerUp = (e) => {
+        const d = drag.current;
+        drag.current = null;
+        if (d && !d.moved) {
+          // 未拖拽 = 一次点击：命中面/边则触发单击/双击判定
+          fireClick(hitTest(e.clientX, e.clientY));
+        }
       };
       const onWheel = (e) => { e.preventDefault(); setView((v) => ({ ...v, zoom: Math.max(0.05, Math.min(20, v.zoom * (e.deltaY < 0 ? 1.12 : 0.9))) })); };
 
@@ -478,13 +576,14 @@ window.__ModuleLoader__.load({
         h('svg', {
           viewBox: '0 0 ' + W + ' ' + H, width: '100%', height: '100%',
           style: { background: 'var(--dsw-alias-bg-base, #fff)', borderRadius: 8, border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', touchAction: 'none', cursor: 'grab', flex: 1, minHeight: 0 },
-          onPointerDown, onWheel, onContextMenu: (e) => e.preventDefault(),
-          onMouseDown: (e) => { if (e.target === e.currentTarget) onSelect(null); },
+          onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp,
+          onWheel, onContextMenu: (e) => e.preventDefault(),
         },
           gridLines.map((g, i) => line(g, 'var(--dsw-alias-border-l1, #e5e7eb)', 0.5)),
           axes.map((a, i) => line(a.pts, a.color, 1.2)),
           h('g', null, faceEls),
-          h('g', null, edgeEls)),
+          h('g', null, edgeEls),
+          h('g', null, overlayEls)),
         h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 } },
           h('span', { style: { flex: 1, color: selected ? 'var(--dsw-alias-brand-primary, #2563eb)' : 'var(--dsw-alias-label-tertiary, #9ca3af)', fontWeight: selected ? 600 : 400 } }, selText),
           h('span', { style: { color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } },
@@ -778,11 +877,26 @@ window.__ModuleLoader__.load({
       const [editingFeatureId, setEditingFeatureId] = React.useState(null);
       // 模型视窗的旋转轴心（默认为 null → 用模型包围盒中心）；用户可设自定义轴心
       const [modelPivot, setModelPivot] = React.useState(null);
+      // 主体（被加工零件）的位移/旋转，与夹具/毛坯同款 transform
+      const [mainTransform, setMainTransform] = React.useState(null); // { translate:[x,y,z], rotate:[rx,ry,rz] } | null
+      const [mainTf, setMainTf] = React.useState({ translate: [0, 0, 0], rotate: [0, 0, 0] }); // 输入框暂存
       // 点击左侧标注列表项 → 定位到模型对应面/边并高亮（{ kind, id }）
       const [locateTarget, setLocateTarget] = React.useState(null);
+      // 夹具 / 毛坯（额外叠加到模型视窗的模型，供 AI 了解夹持与毛坯形状）
+      const [assets, setAssets] = React.useState([]);        // [{ id, name, role:'fixture'|'blank', path }]
+      const [assetScenes, setAssetScenes] = React.useState({}); // id -> scene
+      const [assetName, setAssetName] = React.useState('');
+      const [assetPath, setAssetPath] = React.useState('');
+      const [assetRole, setAssetRole] = React.useState('blank'); // 'blank' | 'fixture'
+      // 夹具/毛坯位姿调整：选中的 asset id + 其 translate(mm)/rotate(deg)
+      const [editingAssetId, setEditingAssetId] = React.useState(null);
+      const [assetTransform, setAssetTransform] = React.useState({ translate: [0, 0, 0], rotate: [0, 0, 0] });
       // 打赏二维码弹窗
       const [showReward, setShowReward] = React.useState(false);
+      // 底部设置区（主体零件位移/旋转 + 夹具/毛坯）折叠/展开
+      const [setupCollapsed, setSetupCollapsed] = React.useState(false);
       const panelRef = React.useRef(null);
+      const assetFileRef = React.useRef(null); // 隐藏的 <input type=file>，用于原生「打开文件」对话框选择 STEP
       // 可拖拽调节的面板宽度（像素），持久化到 localStorage
       const [panelWidth, setPanelWidth] = React.useState(() => {
         try {
@@ -935,9 +1049,12 @@ window.__ModuleLoader__.load({
               setModelScene(d);
               setModelSelected(null);
               setAnnotating(false);
+              setMainTransform(null);
+              setMainTf({ translate: [0, 0, 0], rotate: [0, 0, 0] });
               setViewMode('model');
               setModelFile(p);
               loadFeatures(p);
+              loadAssets(p);
             } else {
               setErr((d && d.error) || '模型加载失败');
             }
@@ -1002,6 +1119,129 @@ window.__ModuleLoader__.load({
           .catch((e) => setErr(String(e)))
           .finally(() => setBusy(false));
       }, [post, modelFile]);
+
+      // ---- 夹具 / 毛坯（上传后叠加到模型视窗，供 AI 了解夹持与毛坯） ----
+      const loadAssets = React.useCallback((modelPath) => {
+        if (!modelPath) return;
+        fetch('/dsh-cam/assets?model=' + encodeURIComponent(modelPath))
+          .then((r) => r.json())
+          .then((d) => {
+            if (!d.ok || !Array.isArray(d.assets)) return;
+            setAssets(d.assets);
+            // 逐个拉取已网格化的夹具/毛坯场景
+            for (const a of d.assets) {
+              fetch('/dsh-cam/asset-scene?id=' + encodeURIComponent(a.id) + '&model=' + encodeURIComponent(modelPath))
+                .then((r2) => r2.json())
+                .then((d2) => {
+                  if (d2.ok && d2.scene) setAssetScenes((prev) => ({ ...prev, [a.id]: d2.scene }));
+                })
+                .catch(() => {});
+            }
+          })
+          .catch(() => {});
+      }, []);
+      const addAsset = React.useCallback(() => {
+        const p = assetPath.trim();
+        if (!p) { setErr('请选择夹具/毛坯的 STEP 模型文件'); return; }
+        if (!modelFile) { setErr('请先加载主模型（零件）'); return; }
+        setBusy(true); setErr(null);
+        post('/dsh-cam/assets', { model: modelFile, name: assetName.trim(), role: assetRole, path: p })
+          .then((d) => {
+            if (d.ok && Array.isArray(d.assets)) {
+              setAssets(d.assets);
+              setAssetName('');
+              setAssetPath('');
+              // 重新拉取场景（新增的这条可能刚网格化完成）
+              loadAssets(modelFile);
+            } else setErr(d.error || '上传失败');
+          })
+          .catch((e) => setErr(String(e)))
+          .finally(() => setBusy(false));
+      }, [post, modelFile, assetName, assetPath, assetRole, loadAssets]);
+      // 打开原生文件对话框选 STEP，读字节 POST 到 host 存盘，返回绝对路径填入 assetPath
+      const pickAssetFile = React.useCallback(() => {
+        const el = assetFileRef.current;
+        if (el) el.click();
+      }, []);
+      const onAssetFileChosen = React.useCallback((e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        const name = file.name || 'upload.step';
+        const reader = new FileReader();
+        reader.onload = () => {
+          const base64 = String(reader.result || '').split(',')[1] || '';
+          if (!base64) { setErr('读取文件失败'); return; }
+          setBusy(true); setErr(null);
+          post('/dsh-cam/upload', { name, data: base64 })
+            .then((d) => {
+              if (d.ok && d.path) {
+                setAssetPath(d.path);
+                if (!assetName.trim()) setAssetName(name.replace(/\.[^.]+$/, ''));
+              } else setErr(d.error || '上传失败');
+            })
+            .catch((err) => setErr(String(err)))
+            .finally(() => setBusy(false));
+        };
+        reader.onerror = () => setErr('读取文件失败');
+        reader.readAsDataURL(file);
+        e.target.value = '';
+      }, [post, assetName]);
+      const removeAsset = React.useCallback((a) => {
+        if (!modelFile) return;
+        setBusy(true); setErr(null);
+        post('/dsh-cam/assets', { model: modelFile, op: 'delete', id: a.id })
+          .then((d) => {
+            if (d.ok && Array.isArray(d.assets)) {
+              setAssets(d.assets);
+              setAssetScenes((prev) => { const n = { ...prev }; delete n[a.id]; return n; });
+            } else setErr(d.error || '删除失败');
+          })
+          .catch((e) => setErr(String(e)))
+          .finally(() => setBusy(false));
+      }, [post, modelFile]);
+      // 夹具/毛坯位姿调整：选中某条后，编辑 translate(mm)/rotate(deg) 并保存
+      const startEditAsset = React.useCallback((a) => {
+        setEditingAssetId(a.id);
+        const t = a.transform || { translate: [0, 0, 0], rotate: [0, 0, 0] };
+        setAssetTransform({
+          translate: Array.isArray(t.translate) ? t.translate.slice(0, 3) : [0, 0, 0],
+          rotate: Array.isArray(t.rotate) ? t.rotate.slice(0, 3) : [0, 0, 0],
+        });
+      }, []);
+      const saveAssetTransform = React.useCallback(() => {
+        if (!modelFile || !editingAssetId) return;
+        setBusy(true); setErr(null);
+        post('/dsh-cam/assets', { model: modelFile, op: 'transform', id: editingAssetId, transform: assetTransform })
+          .then((d) => {
+            if (d.ok && Array.isArray(d.assets)) {
+              setAssets(d.assets);
+              setEditingAssetId(null);
+              // 更新叠加渲染用的 transform（asset-scene 里已带 transform，重拉即可）
+              loadAssets(modelFile);
+            } else setErr(d.error || '保存位姿失败');
+          })
+          .catch((e) => setErr(String(e)))
+          .finally(() => setBusy(false));
+      }, [post, modelFile, editingAssetId, assetTransform, loadAssets]);
+      const tfInput = () => ({ ...input, width: 58, padding: '4px 6px', fontSize: 12, textAlign: 'center' });
+      const setTf = (axis, idx, val) => setAssetTransform((prev) => {
+        const n = prev[axis].slice();
+        n[idx] = Number(val) || 0;
+        return { ...prev, [axis]: n };
+      });
+      // 主体（被加工零件）位姿：临时输入 + 应用
+      const setMainTfAxis = (axis, idx, val) => setMainTf((prev) => {
+        const n = prev[axis].slice();
+        n[idx] = Number(val) || 0;
+        return { ...prev, [axis]: n };
+      });
+      const applyMainTransform = React.useCallback(() => {
+        setMainTransform({ translate: mainTf.translate.slice(0, 3), rotate: mainTf.rotate.slice(0, 3) });
+      }, [mainTf]);
+      const resetMainTransform = React.useCallback(() => {
+        setMainTransform(null);
+        setMainTf({ translate: [0, 0, 0], rotate: [0, 0, 0] });
+      }, []);
 
       const ncCount = files.nc.length;
 
@@ -1245,6 +1485,8 @@ window.__ModuleLoader__.load({
                   h('div', { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' } },
                     h(ModelViewer3D, {
                       scene: modelScene, selected: modelSelected, pivot: modelPivot, features: modelFeatures, locate: locateTarget,
+                      transform: mainTransform,
+                      overlays: assets.filter((a) => assetScenes[a.id]).map((a) => ({ asset: a, scene: assetScenes[a.id] })),
                       onSelect: (sel) => { setModelSelected(sel); setAnnotating(false); },
                       onAnnotate: (sel) => {
                         setModelSelected(sel);
@@ -1276,6 +1518,28 @@ window.__ModuleLoader__.load({
                         ? h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } },
                             '当前 (' + modelPivot.map((v) => Math.round(v)).join(', ') + ')')
                         : null),
+                    // ---- 底部设置区折叠开关：折叠/展开 主体零件位移旋转 + 夹具/毛坯 ----
+                    h('button', {
+                      onClick: () => setSetupCollapsed((v) => !v),
+                      title: setupCollapsed ? '展开设置' : '收起设置',
+                      style: { ...btn, width: '100%', fontSize: 11, padding: '6px 10px', marginTop: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, cursor: 'pointer' },
+                    },
+                      h('span', { style: { fontSize: 11 } }, setupCollapsed ? '▶' : '▼'),
+                      '设置面板 ' + (setupCollapsed ? '（已折叠）' : '（主体零件 · 位移旋转 / 夹具 / 毛坯）')),
+                    !setupCollapsed && h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, padding: 8, marginTop: 6, borderRadius: 8, background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)', border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)' } },
+                      h('div', { style: { fontSize: 11, fontWeight: 700, color: 'var(--dsw-alias-label-primary, #111)' } }, '主体零件 · 位移 / 旋转'),
+                      h('div', { style: { fontSize: 10, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } }, '平移(mm) 与 旋转(度)，应用到被加工零件模型'),
+                      h('div', { style: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--dsw-alias-label-secondary, #6b7280)' } },
+                        h('span', { style: { width: 34 } }, '平移X'), h('input', { type: 'number', step: 0.5, style: tfInput(), value: mainTf.translate[0], onChange: (e) => setMainTfAxis('translate', 0, e.target.value) }),
+                        h('span', { style: { width: 34 } }, '平移Y'), h('input', { type: 'number', step: 0.5, style: tfInput(), value: mainTf.translate[1], onChange: (e) => setMainTfAxis('translate', 1, e.target.value) }),
+                        h('span', { style: { width: 34 } }, '平移Z'), h('input', { type: 'number', step: 0.5, style: tfInput(), value: mainTf.translate[2], onChange: (e) => setMainTfAxis('translate', 2, e.target.value) })),
+                      h('div', { style: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--dsw-alias-label-secondary, #6b7280)' } },
+                        h('span', { style: { width: 34 } }, '旋转X'), h('input', { type: 'number', step: 1, style: tfInput(), value: mainTf.rotate[0], onChange: (e) => setMainTfAxis('rotate', 0, e.target.value) }),
+                        h('span', { style: { width: 34 } }, '旋转Y'), h('input', { type: 'number', step: 1, style: tfInput(), value: mainTf.rotate[1], onChange: (e) => setMainTfAxis('rotate', 1, e.target.value) }),
+                        h('span', { style: { width: 34 } }, '旋转Z'), h('input', { type: 'number', step: 1, style: tfInput(), value: mainTf.rotate[2], onChange: (e) => setMainTfAxis('rotate', 2, e.target.value) })),
+                      h('div', { style: { display: 'flex', gap: 6 } },
+                        h('button', { style: btnPrimary, onClick: applyMainTransform }, '应用到位'),
+                        h('button', { style: btn, onClick: resetMainTransform }, '复位'))),
                     modelSelected && annotating
                       ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, padding: 8, marginTop: 6, borderRadius: 8, background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)', border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)' } },
                           h('div', { style: { fontSize: 11, fontWeight: 600, color: 'var(--dsw-alias-label-primary, #111)' } },
@@ -1286,7 +1550,52 @@ window.__ModuleLoader__.load({
                           h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
                             h('button', { style: btnPrimary, onClick: addFeature, disabled: busy }, editingFeatureId ? '保存修改' : '写入识别文件'),
                             h('button', { style: btn, onClick: () => { setModelSelected(null); setAnnotating(false); setEditingFeatureId(null); } }, '取消')))
-                      : null))
+                      : null,
+                    // ---- 上传夹具 / 毛坯（供 AI 了解夹持与毛坯形状） ----
+                    !setupCollapsed && h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, padding: 8, marginTop: 8, borderRadius: 8, background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)', border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)' } },
+                      h('div', { style: { fontSize: 11, fontWeight: 700, color: 'var(--dsw-alias-label-primary, #111)' } }, '夹具 / 毛坯'),
+                      h('div', { style: { fontSize: 10, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } }, '上传毛坯/夹具 STEP，叠加显示，让 AI 了解夹持与加工区域'),
+                      assets.length > 0
+                        ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 3 } },
+                            assets.map((a) => h('div', {
+                              key: a.id,
+                              style: { display: 'flex', alignItems: 'center', gap: 6, padding: '3px 6px', fontSize: 11, borderRadius: 5, background: a.role === 'fixture' ? 'rgba(99,102,241,0.12)' : 'rgba(16,185,129,0.12)', border: '1px solid ' + (a.role === 'fixture' ? 'rgba(79,70,229,0.35)' : 'rgba(5,150,105,0.35)') },
+                            },
+                              h('span', { style: { fontSize: 12 } }, a.role === 'fixture' ? '🔧' : '🧱'),
+                              h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--dsw-alias-label-primary, #111)', cursor: 'pointer' }, onClick: () => startEditAsset(a), title: '点击调整位姿' },
+                                (a.name || (a.role === 'fixture' ? '夹具' : '毛坯')) + (a.role === 'fixture' ? '（夹具）' : '（毛坯）')),
+                              h('button', {
+                                onClick: () => removeAsset(a), title: '删除此夹具/毛坯',
+                                style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 16, height: 16, fontSize: 11, lineHeight: 1, cursor: 'pointer', borderRadius: '50%', border: 'none', background: 'transparent', color: '#f97316', padding: 0 },
+                              }, '✕'))))
+                        : h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } }, '尚未上传夹具/毛坯'),
+                      // 位姿调整面板（选中某条夹具/毛坯后出现）
+                      editingAssetId
+                        ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4, padding: 6, borderRadius: 6, background: 'var(--dsw-alias-bg-base, #fff)', border: '1px dashed #f59e0b' } },
+                            h('div', { style: { fontSize: 11, fontWeight: 700, color: '#b45309' } }, '调整位姿（选中：#' + editingAssetId + '）'),
+                            h('div', { style: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--dsw-alias-label-secondary, #6b7280)' } },
+                              h('span', { style: { width: 34 } }, '平移X'), h('input', { type: 'number', step: 0.5, style: tfInput(), value: assetTransform.translate[0], onChange: (e) => setTf('translate', 0, e.target.value) }),
+                              h('span', { style: { width: 34 } }, '平移Y'), h('input', { type: 'number', step: 0.5, style: tfInput(), value: assetTransform.translate[1], onChange: (e) => setTf('translate', 1, e.target.value) }),
+                              h('span', { style: { width: 34 } }, '平移Z'), h('input', { type: 'number', step: 0.5, style: tfInput(), value: assetTransform.translate[2], onChange: (e) => setTf('translate', 2, e.target.value) })),
+                            h('div', { style: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--dsw-alias-label-secondary, #6b7280)' } },
+                              h('span', { style: { width: 34 } }, '旋转X'), h('input', { type: 'number', step: 1, style: tfInput(), value: assetTransform.rotate[0], onChange: (e) => setTf('rotate', 0, e.target.value) }),
+                              h('span', { style: { width: 34 } }, '旋转Y'), h('input', { type: 'number', step: 1, style: tfInput(), value: assetTransform.rotate[1], onChange: (e) => setTf('rotate', 1, e.target.value) }),
+                              h('span', { style: { width: 34 } }, '旋转Z'), h('input', { type: 'number', step: 1, style: tfInput(), value: assetTransform.rotate[2], onChange: (e) => setTf('rotate', 2, e.target.value) })),
+                            h('div', { style: { display: 'flex', gap: 6 } },
+                              h('button', { style: btnPrimary, onClick: saveAssetTransform, disabled: busy }, '保存位姿'),
+                              h('button', { style: btn, onClick: () => setEditingAssetId(null) }, '取消')))
+                        : null,
+                      h('div', { style: { display: 'flex', gap: 6 } },
+                        h('select', { style: { ...input, width: 74, flexShrink: 0 }, value: assetRole, onChange: (e) => setAssetRole(e.target.value) },
+                          h('option', { value: 'blank' }, '毛坯'),
+                          h('option', { value: 'fixture' }, '夹具')),
+                        h('input', { style: input, value: assetName, placeholder: '名称（可选）', onChange: (e) => setAssetName(e.target.value) }),
+                        h('input', { style: input, value: assetPath, placeholder: 'STEP 路径（点右侧按钮选择）', onChange: (e) => setAssetPath(e.target.value), onKeyDown: (e) => { if (e.key === 'Enter') addAsset(); } })),
+                      h('div', { style: { display: 'flex', gap: 6 } },
+                        h('button', { style: btn, onClick: pickAssetFile, disabled: busy }, '📂 打开文件选择'),
+                        h('button', { style: btnPrimary, onClick: addAsset, disabled: busy }, '上传并叠加显示')),
+                      // 隐藏的原生文件选择框（选单个 STEP，读字节上传后回填路径）
+                      h('input', { type: 'file', accept: '.step,.stp,.brep,.iges,.igs', ref: assetFileRef, style: { display: 'none' }, onChange: onAssetFileChosen }))))
               : h(Viewer3D, { data })),
           // 打赏 footer（左下角）
           h('div', {

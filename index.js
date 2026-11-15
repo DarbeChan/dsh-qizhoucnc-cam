@@ -212,6 +212,7 @@ function scanFiles(rootDir, extRe, maxDepth = 5) {
 // ---- tessellate a STEP/BREP/IGES model into renderable faces + edges via FreeCAD ----
 const MODEL_EXT = /\.(step|stp|brep|iges|igs)$/i;
 const FEATURE_FILE = join(homedir(), '.dsh', 'storages', 'dsh-cam-features.json');
+const ASSETS_FILE = join(homedir(), '.dsh', 'storages', 'dsh-cam-assets.json');
 
 function assertModelPath(modelPath) {
   const p = resolvePath(modelPath);
@@ -276,6 +277,107 @@ function appendFeature(modelPath, feature) {
   all[p] = list;
   saveFeatures(all);
   return list;
+}
+
+// update an existing feature by id (rename / re-note / re-target); returns the updated list
+function updateFeature(modelPath, feature) {
+  const p = resolvePath(modelPath);
+  const all = loadFeatures();
+  const list = Array.isArray(all[p]) ? all[p] : [];
+  const idx = list.findIndex((x) => x && x.id === feature.id);
+  if (idx < 0) return list;
+  const cur = list[idx];
+  list[idx] = {
+    ...cur,
+    name: feature.name !== undefined ? String(feature.name) : cur.name,
+    note: feature.note !== undefined ? String(feature.note) : cur.note,
+    kind: feature.kind === 'edge' ? 'edge' : (feature.kind === 'face' ? 'face' : cur.kind),
+    refId: feature.refId !== undefined ? Number(feature.refId) : cur.refId,
+  };
+  all[p] = list;
+  saveFeatures(all);
+  return list;
+}
+
+// remove a feature by id; returns the updated list
+function deleteFeature(modelPath, featureId) {
+  const p = resolvePath(modelPath);
+  const all = loadFeatures();
+  const list = Array.isArray(all[p]) ? all[p] : [];
+  const next = list.filter((x) => !x || x.id !== featureId);
+  all[p] = next;
+  saveFeatures(all);
+  return next;
+}
+
+// ---- fixtures & blanks (毛坯/夹具): extra models overlaid on the part, with a role ----
+const ASSETS_DIR = join(homedir(), '.dsh', 'storages', 'dsh-cam-assets');
+function loadAssets() {
+  try { return JSON.parse(readFileSync(ASSETS_FILE, 'utf8')) || {}; } catch { return {}; }
+}
+function saveAssets(all) {
+  try {
+    mkdirSync(dirname(ASSETS_FILE), { recursive: true });
+    writeFileSync(ASSETS_FILE, JSON.stringify(all, null, 2), 'utf8');
+  } catch { /* ignore */ }
+}
+function assetSceneFile(id) { return join(ASSETS_DIR, id + '.json'); }
+// 夹具/毛坯相对零件的位姿：平移(mm) + 旋转(绕 X/Y/Z 度)。缺省 = 无平移无旋转。
+function normalizeTransform(t) {
+  if (!t || typeof t !== 'object') return { translate: [0, 0, 0], rotate: [0, 0, 0] };
+  const to3 = (v, dflt) => Array.isArray(v) ? v.slice(0, 3).map((n) => Number(n) || 0) : dflt;
+  return { translate: to3(t.translate, [0, 0, 0]), rotate: to3(t.rotate, [0, 0, 0]) };
+}
+// add or replace a fixture/blank by tessellating its STEP now; returns the updated list
+function upsertAsset(modelPath, asset, opts = {}) {
+  const p = resolvePath(modelPath);
+  const all = loadAssets();
+  const list = Array.isArray(all[p]) ? all[p] : [];
+  const item = {
+    id: asset.id ?? (Date.now().toString(36) + Math.random().toString(36).slice(2, 6)),
+    name: String(asset.name || (asset.role === 'fixture' ? '夹具' : '毛坯')),
+    role: asset.role === 'fixture' ? 'fixture' : 'blank',
+    path: resolvePath(asset.path),
+    createdAt: asset.createdAt ?? new Date().toISOString(),
+    transform: normalizeTransform(asset.transform),
+  };
+  let scene = null;
+  try { scene = tessellateModel(item.path, opts); } catch { scene = null; }
+  if (scene) {
+    try { mkdirSync(ASSETS_DIR, { recursive: true }); writeFileSync(assetSceneFile(item.id), JSON.stringify(scene), 'utf8'); } catch { /* ignore */ }
+  }
+  const idx = list.findIndex((x) => x && x.id === item.id);
+  if (idx >= 0) list[idx] = item; else list.push(item);
+  all[p] = list;
+  saveAssets(all);
+  return list;
+}
+function deleteAsset(modelPath, assetId) {
+  const p = resolvePath(modelPath);
+  const all = loadAssets();
+  const list = Array.isArray(all[p]) ? all[p] : [];
+  const next = list.filter((x) => !x || x.id !== assetId);
+  all[p] = next;
+  saveAssets(all);
+  try { unlinkSync(assetSceneFile(assetId)); } catch { /* ignore */ }
+  return next;
+}
+// update only the pose (translate/rotate) of one asset; scene stays cached
+function updateAssetTransform(modelPath, assetId, transform) {
+  const p = resolvePath(modelPath);
+  const all = loadAssets();
+  const list = Array.isArray(all[p]) ? all[p] : [];
+  const idx = list.findIndex((x) => x && x.id === assetId);
+  if (idx >= 0) {
+    list[idx] = { ...list[idx], transform: normalizeTransform(transform) };
+    all[p] = list;
+    saveAssets(all);
+  }
+  return list;
+}
+// read an asset's cached tessellation scene (or null if not yet tessellated)
+function assetSceneOf(asset) {
+  try { return JSON.parse(readFileSync(assetSceneFile(asset.id), 'utf8')) || null; } catch { return null; }
 }
 
 // ---- generate a G-code toolpath from a STEP/BREP/IGES model via FreeCAD CAM ----
@@ -524,6 +626,16 @@ export function apply(ctx, config = {}) {
           if (req.method === 'POST') {
             const parsed = await readBody(req);
             const model = parsed.model ?? url.searchParams.get('model');
+            if (parsed.op === 'update') {
+              const list = updateFeature(model, parsed);
+              send(res, { ok: true, model: resolvePath(model), features: list });
+              return;
+            }
+            if (parsed.op === 'delete') {
+              const list = deleteFeature(model, parsed.id);
+              send(res, { ok: true, model: resolvePath(model), features: list });
+              return;
+            }
             const list = appendFeature(model, parsed);
             send(res, { ok: true, model: resolvePath(model), features: list });
             return;
@@ -532,6 +644,89 @@ export function apply(ctx, config = {}) {
           const all = loadFeatures();
           const p = resolvePath(model);
           send(res, { ok: true, model: p, features: Array.isArray(all[p]) ? all[p] : [] });
+        } catch (e) {
+          send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
+        }
+      },
+    }));
+
+    // list / add / remove fixture & blank (毛坯/夹具) models overlaid on the part
+    routeDisposers.push(server.register({
+      kind: 'prefix',
+      path: '/dsh-cam/assets',
+      handler: async (req, res) => {
+        try {
+          const url = new URL(req.url ?? '/', 'http://localhost');
+          const model = url.searchParams.get('model');
+          if (req.method === 'POST') {
+            const parsed = await readBody(req);
+            const key = parsed.model ?? url.searchParams.get('model');
+            if (!key) { send(res, { ok: false, error: 'model query param required' }, 400); return; }
+            if (parsed.op === 'delete') {
+              const list = deleteAsset(key, parsed.id);
+              send(res, { ok: true, model: resolvePath(key), assets: list });
+              return;
+            }
+            if (parsed.op === 'transform') {
+              const list = updateAssetTransform(key, parsed.id, parsed.transform);
+              send(res, { ok: true, model: resolvePath(key), assets: list });
+              return;
+            }
+            const list = upsertAsset(key, parsed, { freecadBin });
+            send(res, { ok: true, model: resolvePath(key), assets: list });
+            return;
+          }
+          if (!model) { send(res, { ok: false, error: 'model query param required' }, 400); return; }
+          const all = loadAssets();
+          const p = resolvePath(model);
+          send(res, { ok: true, model: p, assets: Array.isArray(all[p]) ? all[p] : [] });
+        } catch (e) {
+          send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
+        }
+      },
+    }));
+
+    // read one asset's tessellated scene (for overlay rendering)
+    routeDisposers.push(server.register({
+      kind: 'prefix',
+      path: '/dsh-cam/asset-scene',
+      handler: async (req, res) => {
+        try {
+          const url = new URL(req.url ?? '/', 'http://localhost');
+          const id = url.searchParams.get('id');
+          const model = url.searchParams.get('model');
+          if (!id || !model) { send(res, { ok: false, error: 'id and model query params required' }, 400); return; }
+          const all = loadAssets();
+          const p = resolvePath(model);
+          const list = Array.isArray(all[p]) ? all[p] : [];
+          const asset = list.find((x) => x && x.id === id);
+          if (!asset) { send(res, { ok: false, error: 'asset not found' }, 404); return; }
+          const scene = assetSceneOf(asset);
+          if (!scene) { send(res, { ok: false, error: 'asset scene not tessellated' }, 404); return; }
+          send(res, { ok: true, asset: { id: asset.id, name: asset.name, role: asset.role, path: asset.path, transform: asset.transform }, scene });
+        } catch (e) {
+          send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
+        }
+      },
+    }));
+
+    // 上传单个 STEP 文件（浏览器 <input type=file> 拿不到绝对路径，改为把文件字节 POST 上来，落到项目 uploads/ 目录并返回绝对路径）
+    routeDisposers.push(server.register({
+      kind: 'prefix',
+      path: '/dsh-cam/upload',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { send(res, { ok: false, error: 'POST only' }, 405); return; }
+        try {
+          const parsed = await readBody(req);
+          const name = String(parsed.name || '').replace(/[\\/]/g, '_');
+          const data = parsed.data; // base64 string
+          if (!name || !data) { send(res, { ok: false, error: 'name and data(base64) required' }, 400); return; }
+          const buf = Buffer.from(data, 'base64');
+          const dir = join(ASSETS_DIR, 'uploads');
+          mkdirSync(dir, { recursive: true });
+          const dest = join(dir, Date.now().toString(36) + '-' + name);
+          writeFileSync(dest, buf);
+          send(res, { ok: true, path: dest, name });
         } catch (e) {
           send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
         }
