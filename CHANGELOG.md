@@ -2,6 +2,14 @@
 
 本文件记录 DSH-QizhouCNC_CAM 的各版本变更。
 
+## [1.3.11] - 2026-11-15
+
+### 修复 (Fixed)
+
+- **Windows 下载 FreeCAD 连接被重置**：GitHub 直连在国内不稳定（`curl (56) Recv failure: Connection was reset`）。改为多源回退下载：优先 GitHub 官方直连，失败自动回退国内加速镜像（`mirror.ghproxy.com` / `ghproxy.net`），并加入 `--connect-timeout` 与断点续传 `-C -`，提高 Windows/Linux 机器下载成功率。
+
+---
+
 ## [1.3.10] - 2026-11-15
 
 ### 修复 (Fixed)

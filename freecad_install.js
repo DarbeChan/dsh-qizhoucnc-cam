@@ -2,7 +2,7 @@
 // 覆盖：Linux AppImage（解压 --appimage-extract）、Windows 7z（需本机 7z 解压）。
 // macOS 暂不支持自动下载（返回明确提示），当前机器默认路径 /Applications/FreeCAD.app 已可被 resolveFreecadBin 探测。
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync, readFileSync, chmodSync, readdirSync, statSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, readFileSync, chmodSync, readdirSync, statSync, renameSync, unlinkSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -118,13 +118,42 @@ function extractAsset(dest, kind) {
   throw new Error('不支持的资产类型：' + kind);
 }
 
+// 下载 FreeCAD 资产（重试 + 国内镜像回退）。成功后返回最终下载路径。
+function downloadAsset(asset, dest, onChunk) {
+  // 从 GitHub 直连下载（国内可能被重置）。失败则回退国内加速镜像 ghproxy。
+  const urls = [asset.url, 'https://mirror.ghproxy.com/' + asset.url, 'https://ghproxy.net/' + asset.url];
+  return new Promise((resolve, reject) => {
+    const tryUrl = (idx) => {
+      if (idx >= urls.length) { reject(new Error('所有下载源均失败')); return; }
+      const url = urls[idx];
+      // 每个源内部先做「首次小范围续传探测」，避免部分节点刚连上就被重置。
+      const child = spawn('curl', ['-L', '--fail', '--retry', '3', '--retry-delay', '2', '--connect-timeout', '15', '--max-time', '0', '-C', '-', '-o', dest, '--progress-bar', url], {
+        cwd: FREEACAD_DIR, stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      let errBuf = '';
+      child.stderr.on('data', (d) => { errBuf += String(d); });
+      child.on('exit', (code) => {
+        if (code === 0) { resolve(dest); return; }
+        // 记录失败，回退下一个源
+        if (idx + 1 < urls.length) {
+          try { unlinkSync(dest); } catch { /* ignore */ }
+          tryUrl(idx + 1);
+        } else {
+          reject(new Error('下载失败：' + (errBuf.slice(-300) || ('exit ' + code))));
+        }
+      });
+    };
+    tryUrl(0);
+  });
+}
+
 // 后台下载（幂等：已在下载/已就绪则直接返回状态）。返回当前状态快照。
 export function ensureFreecadDownload() {
   if (memoryState.bin && existsSync(memoryState.bin)) {
     return { ...memoryState, phase: 'done' };
   }
-  if (downloadJob && downloadJob.exitCode === null) {
-    return memoryState; // 正在下载
+  if (downloadJob) {
+    return memoryState; // 正在下载/回退链中
   }
   const { supported, spec, asset, reason } = freecadAsset();
   if (!supported) {
@@ -133,26 +162,24 @@ export function ensureFreecadDownload() {
   mkdirSync(FREEACAD_DIR, { recursive: true });
   const dest = join(FREEACAD_DIR, asset.name);
   setState({ phase: 'downloading', asset: asset.name, url: asset.url, dest, total: asset.size, downloaded: 0, error: null, bin: null });
-  const child = spawn('curl', ['-L', '--fail', '--retry', '3', '--retry-delay', '3', '-C', '-', '-o', dest, asset.url], {
-    cwd: FREEACAD_DIR, stdio: ['ignore', 'ignore', 'pipe'],
-  });
-  let errBuf = '';
-  child.stderr.on('data', (d) => { errBuf += String(d); });
-  child.on('exit', (code) => {
-    downloadJob = null;
-    if (code !== 0) {
-      setState({ phase: 'error', error: '下载失败：' + (errBuf.slice(-400) || ('exit ' + code)) });
-      return;
-    }
+  const running = { done: false };
+  downloadJob = running;
+  downloadAsset(asset, dest).then(() => {
     try {
       setState({ phase: 'extracting' });
       const bin = extractAsset(dest, spec.kind);
       setState({ phase: 'done', bin, downloaded: asset.size });
     } catch (e) {
       setState({ phase: 'error', error: String(e && e.message ? e.message : e) });
+    } finally {
+      running.done = true;
+      downloadJob = null;
     }
+  }).catch((e) => {
+    setState({ phase: 'error', error: String(e && e.message ? e.message : e) });
+    running.done = true;
+    downloadJob = null;
   });
-  downloadJob = child;
   return memoryState;
 }
 
