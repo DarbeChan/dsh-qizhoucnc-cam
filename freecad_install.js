@@ -12,10 +12,10 @@ const RELEASES_API = 'https://api.github.com/repos/FreeCAD/FreeCAD/releases/late
 
 // 各平台可选用的便携资产（Windows 用 7z，Linux 用 AppImage；macOS 暂无便携方案，标记 unsupported）。
 const PLATFORM_ASSETS = {
-  'linux-x64':   { label: 'Linux x86_64 AppImage',   pattern: /FreeCAD_.*-Linux-x86_64\.AppImage$/i,   kind: 'appimage' },
-  'linux-arm64': { label: 'Linux aarch64 AppImage',  pattern: /FreeCAD_.*-Linux-aarch64\.AppImage$/i,  kind: 'appimage' },
-  'win32-x64':   { label: 'Windows x86_64 7z',       pattern: /FreeCAD_.*-Windows-x86_64\.7z$/i,       kind: '7z' },
-  'win32-arm64': { label: 'Windows arm64 7z',        pattern: /FreeCAD_.*-Windows-arm64\.7z$/i,        kind: '7z' },
+  'linux-x64':   { label: 'Linux x86_64 AppImage',   pattern: /FreeCAD_.*-Linux-x86_64.*\.AppImage$/i,   kind: 'appimage' },
+  'linux-arm64': { label: 'Linux aarch64 AppImage',  pattern: /FreeCAD_.*-Linux-aarch64.*\.AppImage$/i,  kind: 'appimage' },
+  'win32-x64':   { label: 'Windows x86_64 7z',       pattern: /FreeCAD_.*-Windows-x86_64.*\.7z$/i,       kind: '7z' },
+  'win32-arm64': { label: 'Windows arm64 7z',        pattern: /FreeCAD_.*-Windows-arm64.*\.7z$/i,        kind: '7z' },
   'darwin-arm64':{ label: 'macOS arm64 dmg',         pattern: /FreeCAD_.*-macOS-arm64.*\.dmg$/i,        kind: 'dmg' },
   'darwin-x64':  { label: 'macOS x86_64 dmg',        pattern: /FreeCAD_.*-macOS-x86_64.*\.dmg$/i,       kind: 'dmg' },
 };
@@ -71,7 +71,8 @@ export function freecadAsset() {
 // 扫描便携目录，返回已解压好的 freecadcmd 绝对路径，或 null。
 export function portableFreecadBin() {
   if (!existsSync(FREEACAD_DIR)) return null;
-  const want = process.platform === 'win32' ? 'freecadcmd.exe' : 'freecadcmd';
+  // Windows 实际二进制名是 FreeCADCmd.exe（大写 C），Linux 是 freecadcmd；用大小写不敏感匹配。
+  const want = process.platform === 'win32' ? /^freecadcmd\.exe$/i : /^freecadcmd$/;
   const stack = [FREEACAD_DIR];
   while (stack.length) {
     const dir = stack.pop();
@@ -81,7 +82,7 @@ export function portableFreecadBin() {
       const p = join(dir, name);
       let st; try { st = statSync(p); } catch { continue; }
       if (st.isDirectory()) { stack.push(p); continue; }
-      if (name === want) return p;
+      if (want.test(name)) return p;
     }
   }
   return null;

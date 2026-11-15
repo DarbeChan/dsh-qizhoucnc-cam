@@ -2,6 +2,15 @@
 
 本文件记录 DSH-QizhouCNC_CAM 的各版本变更。
 
+## [1.3.10] - 2026-11-15
+
+### 修复 (Fixed)
+
+- **FreeCAD 自动下载资产匹配失败**：修复 Windows/Linux 资产名匹配正则（官方 release 资产名含 `-py311` 中间段，旧正则 `FreeCAD_.*-Windows-x86_64\.7z$` 无法命中），导致「未能在 FreeCAD 官方 release 中找到匹配当前平台的资产」。已改为 `FreeCAD_.*-Windows-x86_64.*\.7z` 与 `FreeCAD_.*-Linux-x86_64.*\.AppImage` 等。
+- **Windows 便携版二进制识别**：`portableFreecadBin` 的二进制名匹配改为大小写不敏感（Windows 实际为 `FreeCADCmd.exe`，旧代码只匹配 `freecadcmd.exe`）。
+
+---
+
 ## [1.3.9] - 2026-11-15
 
 ### 修复 (Fixed)
