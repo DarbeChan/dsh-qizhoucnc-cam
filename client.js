@@ -314,7 +314,7 @@ window.__ModuleLoader__.load({
     // scene 来自 /dsh-cam/model：{ bounds:{min,max}, faces:[{id,vertices,triangles,center,area}], edges:[{id,points}] }
     // selected: { kind:'face'|'edge', id } | null；点击面/边时回传 onSelect。
     // pivot: [x,y,z] 旋转轴心；默认取模型包围盒中心。旋转/缩放都围绕该点。
-    function ModelViewer3D({ scene, selected, onSelect, onAnnotate, pivot, features, locate, overlays, transform, maximized, onToggleMaximize }) {
+    function ModelViewer3D({ scene, selected, selectedSet, onSelect, onAnnotate, onSelectMulti, pivot, features, locate, overlays, transform, maximized, onToggleMaximize }) {
       const [view, setView] = React.useState(null);
       const drag = React.useRef(null);
       // 单击/双击判定：记录上次点击的目标与时间（同目标 350ms 内再次点击 = 双击标注）
@@ -322,6 +322,12 @@ window.__ModuleLoader__.load({
       const clickTimer = React.useRef(null);
       const svgRef = React.useRef(null);
       const W = 600, H = 460, cx = W / 2, cy = H / 2;
+      // 多选集合的命中映射：kind:id -> true
+      const selSetMap = React.useMemo(() => {
+        const m = {};
+        for (const s of (selectedSet || [])) m[s.kind + ':' + s.id] = true;
+        return m;
+      }, [selectedSet]);
       const pv = pivot || [0, 0, 0];
       // 主体模型的位移/旋转（与夹具/毛坯同款 transform）：{ translate:[x,y,z], rotate:[rx,ry,rz] }
       const xf = transform || null;
@@ -445,13 +451,14 @@ window.__ModuleLoader__.load({
       const faceEls = [];
       for (const f of scene.faces) {
         const isSel = selected && selected.kind === 'face' && selected.id === f.id;
+        const isMultiSel = !!selSetMap['face:' + f.id];
         const isFeat = featMap['face:' + f.id];
         const isLoc = locateKey === 'face:' + f.id;
         const shade = shadeOf(faceNormal(f));
         const r = Math.round(96 * shade), g = Math.round(116 * shade), b = Math.round(140 * shade);
         const baseFill = 'rgb(' + r + ',' + g + ',' + b + ')';
         const hoverFill = 'rgb(' + Math.min(255, r + 42) + ',' + Math.min(255, g + 42) + ',' + Math.min(255, b + 42) + ')';
-        const fillColor = isLoc ? LOCATE_FILL : (isFeat ? FEAT_FILL : (isSel ? FACE_SELECTED : baseFill));
+        const fillColor = isLoc ? LOCATE_FILL : (isFeat ? FEAT_FILL : ((isSel || isMultiSel) ? FACE_SELECTED : baseFill));
         let d = '';
         for (const tri of f.triangles) {
           const a = f.vertices[tri[0]], b = f.vertices[tri[1]], c = f.vertices[tri[2]];
@@ -464,18 +471,19 @@ window.__ModuleLoader__.load({
           key: 'f' + f.id,
           d,
           fill: fillColor,
-          stroke: isLoc ? LOCATE_STROKE : (isFeat ? '#f97316' : (isSel ? '#f97316' : FACE_STROKE)),
-          strokeWidth: isLoc ? 2.4 : (isFeat ? 0.8 : 0.4), strokeLinejoin: 'round',
+          stroke: isLoc ? LOCATE_STROKE : (isFeat ? '#f97316' : ((isSel || isMultiSel) ? '#f97316' : FACE_STROKE)),
+          strokeWidth: isLoc ? 2.4 : (isFeat ? 0.8 : ((isSel || isMultiSel) ? 0.8 : 0.4)), strokeLinejoin: 'round',
           style: { cursor: 'pointer' },
           'data-hit': 'face', 'data-id': f.id,
-          onMouseEnter: (e) => { if (!isSel && !isFeat && !isLoc) e.currentTarget.setAttribute('fill', hoverFill); },
-          onMouseLeave: (e) => { if (!isSel && !isFeat && !isLoc) e.currentTarget.setAttribute('fill', baseFill); },
+          onMouseEnter: (e) => { if (!isSel && !isMultiSel && !isFeat && !isLoc) e.currentTarget.setAttribute('fill', hoverFill); },
+          onMouseLeave: (e) => { if (!isSel && !isMultiSel && !isFeat && !isLoc) e.currentTarget.setAttribute('fill', baseFill); },
         }));
       }
       // edges as individual <polyline> for picking
       const edgeEls = [];
       for (const e of scene.edges) {
         const isSel = selected && selected.kind === 'edge' && selected.id === e.id;
+        const isMultiSel = !!selSetMap['edge:' + e.id];
         const isFeat = featMap['edge:' + e.id];
         const isLoc = locateKey === 'edge:' + e.id;
         let pts = '';
@@ -484,8 +492,8 @@ window.__ModuleLoader__.load({
           key: 'e' + e.id,
           points: pts,
           fill: 'none',
-          stroke: isLoc ? LOCATE_STROKE : (isFeat ? '#f97316' : (isSel ? EDGE_SELECTED : EDGE_COLOR)),
-          strokeWidth: isLoc ? 4.4 : (isFeat ? 3.2 : (isSel ? 3 : 1.4)),
+          stroke: isLoc ? LOCATE_STROKE : (isFeat ? '#f97316' : ((isSel || isMultiSel) ? EDGE_SELECTED : EDGE_COLOR)),
+          strokeWidth: isLoc ? 4.4 : (isFeat ? 3.2 : ((isSel || isMultiSel) ? 3 : 1.4)),
           strokeLinejoin: 'round', strokeLinecap: 'round',
           style: { cursor: 'pointer' },
           'data-hit': 'edge', 'data-id': e.id,
@@ -592,10 +600,18 @@ window.__ModuleLoader__.load({
         return null;
       };
       // 单击/双击：同一面/边 350ms 内两次点击 = 双击（标注），否则单击（选中）。
-      const fireClick = (hit) => {
+      // shiftKey=true 时走多选（Shift+点击），不做双击判定。
+      const fireClick = (hit, shiftKey) => {
         if (!hit) return;
         const now = Date.now();
         const prev = clickState.current;
+        // Shift 多选：直接切换该面/边在多选集合中的状态（不触发双击标注）
+        if (shiftKey && typeof onSelectMulti === 'function') {
+          clearTimeout(clickTimer.current);
+          clickState.current = { time: 0, kind: null, id: null };
+          onSelectMulti({ kind: hit.kind, id: hit.id });
+          return;
+        }
         if (prev && prev.kind === hit.kind && prev.id === hit.id && (now - prev.time) < 350) {
           clearTimeout(clickTimer.current);
           clickState.current = { time: 0, kind: null, id: null };
@@ -647,8 +663,8 @@ window.__ModuleLoader__.load({
         const d = drag.current;
         drag.current = null;
         if (d && !d.moved) {
-          // 未拖拽 = 一次点击：命中面/边则触发单击/双击判定
-          fireClick(hitTest(e.clientX, e.clientY));
+          // 未拖拽 = 一次点击：命中面/边则触发单击/双击判定（Shift = 多选）
+          fireClick(hitTest(e.clientX, e.clientY), !!e.shiftKey);
         }
       };
       const onWheel = (e) => { e.preventDefault(); setView((v) => ({ ...v, zoom: Math.max(0.05, Math.min(20, v.zoom * (e.deltaY < 0 ? 1.12 : 0.9))) })); };
@@ -665,9 +681,11 @@ window.__ModuleLoader__.load({
       }, v.label);
       const activeView = VIEWS.find((v) => Math.abs(v.yaw - view.yaw) < 1e-6 && Math.abs(v.pitch - view.pitch) < 1e-6);
 
+      const selCount = (selectedSet && selectedSet.length) || 0;
       const selText = selected
-        ? (selected.kind === 'face' ? '已选面 #' + selected.id + (selected.area ? ' · ' + Math.round(selected.area) + ' mm²' : '') : '已选边 #' + selected.id) + '（双击标注）'
-        : '单击选中面或边线，双击标注加工位置';
+        ? (selected.kind === 'face' ? '已选面 #' + selected.id + (selected.area ? ' · ' + Math.round(selected.area) + ' mm²' : '') : '已选边 #' + selected.id)
+          + (selCount > 1 ? ' 等 ' + selCount + ' 个（Shift 多选）' : '') + '（双击标注）'
+        : '单击选中面或边线，双击标注加工位置 · Shift+点击多选相同特征';
 
       // 最大化按钮 + 恢复按钮（模型视窗放大/还原）
       const maxBtn = h('button', {
@@ -986,7 +1004,11 @@ window.__ModuleLoader__.load({
       // 模型视窗 / 刀路视窗切换 + 3D 模型 + 选面/选边标注
       const [viewMode, setViewMode] = React.useState('toolpath'); // 'toolpath' | 'model'
       const [modelScene, setModelScene] = React.useState(null);
-      const [modelSelected, setModelSelected] = React.useState(null); // { kind, id, center?, area?, points? }
+      const [modelSelected, setModelSelected] = React.useState(null); // { kind, id, center?, area?, points? } 主选中项
+      // 多选（Shift+点击）：同一类特征的多条选中 { kind, id, center?, area?, points? }
+      const [modelSelectedSet, setModelSelectedSet] = React.useState([]);
+      // 相同特征提示：检测到当前面/边有 N 个相同特征时弹出，可一键「一起标注」
+      const [similarPrompt, setSimilarPrompt] = React.useState(null); // { kind, ids:[], count, label }
       const [annotating, setAnnotating] = React.useState(false); // 双击后进入标注命名态（显示命名输入框）
       const [modelLoading, setModelLoading] = React.useState(false);
       const [modelFeatures, setModelFeatures] = React.useState([]);
@@ -1177,6 +1199,8 @@ window.__ModuleLoader__.load({
             if (d && d.ok && Array.isArray(d.faces)) {
               setModelScene(d);
               setModelSelected(null);
+              setModelSelectedSet([]);
+              setSimilarPrompt(null);
               setAnnotating(false);
               setMainTransform(null);
               setMainTf({ translate: [0, 0, 0], rotate: [0, 0, 0] });
@@ -1191,6 +1215,58 @@ window.__ModuleLoader__.load({
           .catch((e) => setErr(String(e)))
           .finally(() => { setBusy(false); setModelLoading(false); });
       }, [post]);
+
+      // ---- 多选（Shift+点击）与相同特征检测 ----
+      // 选中集合的稳定键：kind:id
+      const selKey = (s) => s.kind + ':' + s.id;
+      // 在场景里找某个 kind:id 对应的面/边详情
+      const sceneHitOf = React.useCallback((kind, id) => {
+        if (!modelScene) return null;
+        if (kind === 'face') return modelScene.faces.find((x) => x.id === id) || null;
+        return modelScene.edges.find((x) => x.id === id) || null;
+      }, [modelScene]);
+
+      // 计算与某面/边「相同特征」的其它面/边 id 列表（基于 tessellation 出的 shapeKey）。
+      const similarIdsOf = React.useCallback((kind, id) => {
+        if (!modelScene) return [];
+        const arr = kind === 'face' ? modelScene.faces : modelScene.edges;
+        const target = arr.find((x) => x.id === id);
+        if (!target || !target.shapeKey) return [];
+        return arr.filter((x) => x.shapeKey && x.shapeKey === target.shapeKey).map((x) => x.id);
+      }, [modelScene]);
+
+      // 统一处理「选中」：单点=单选；Shift+点击=切换多选（限定同一 kind）。
+      // 返回是否进入多选态（选中集合 > 1）。
+      const applySelection = React.useCallback((sel, addToMulti) => {
+        if (!sel) return;
+        setModelSelected(sel);
+        setAnnotating(false);
+        setEditingFeatureId(null);
+        if (addToMulti) {
+          // Shift 多选：同一 kind 内切换
+          setModelSelectedSet((prev) => {
+            const sameKind = prev.filter((s) => s.kind === sel.kind);
+            const idx = sameKind.findIndex((s) => selKey(s) === selKey(sel));
+            if (idx >= 0) return sameKind.filter((s) => selKey(s) !== selKey(sel));
+            return [...sameKind, sel];
+          });
+        } else {
+          setModelSelectedSet([sel]);
+        }
+        setSimilarPrompt(null);
+      }, []);
+
+      // 选中后检测相同特征：若该面/边有 >1 个相同 shapeKey，弹出「一起标注」提示。
+      const detectSimilar = React.useCallback((kind, id) => {
+        const ids = similarIdsOf(kind, id);
+        if (ids.length > 1) {
+          const n = ids.length;
+          const label = kind === 'face' ? '个相同特征的面' : '条相同特征的边';
+          setSimilarPrompt({ kind, ids, count: n, label });
+        } else {
+          setSimilarPrompt(null);
+        }
+      }, [similarIdsOf]);
 
       // 查询 FreeCAD 自动下载/安装状态
       const checkFcStatus = React.useCallback(() => {
@@ -1285,12 +1361,19 @@ window.__ModuleLoader__.load({
           .catch(() => {});
       }, []);
 
-      // 把当前选中的面/边作为「加工位置」标注，命名后写入识别文件
+      // 把当前选中的面/边作为「加工位置」标注，命名后写入识别文件。
+      // 支持批量：refIds 存在时一次写入多条（Shift 多选 或「一起标注」）。
       const addFeature = React.useCallback(() => {
         if (!modelSelected) { setErr('请先在模型视窗中点击一个面或边线'); return; }
         const name = featureName.trim();
         if (!name) { setErr('请为这个加工位置填写名称'); return; }
         setBusy(true); setErr(null);
+        // 批量标注：优先取 similarPrompt.ids 或 modelSelectedSet 的 refIds
+        const multi = similarPrompt && similarPrompt.kind === modelSelected.kind
+          ? similarPrompt.ids
+          : (modelSelectedSet.length > 1 && modelSelectedSet.every((s) => s.kind === modelSelected.kind)
+              ? modelSelectedSet.map((s) => s.id)
+              : null);
         const body = {
           model: modelFile,
           name,
@@ -1298,6 +1381,7 @@ window.__ModuleLoader__.load({
           refId: modelSelected.id,
           note: featureNote.trim(),
         };
+        if (multi && multi.length > 1) body.refIds = multi;
         // 二次修改：若正在编辑某条已有标注，走 update；否则新增
         if (editingFeatureId) body.op = 'update', body.id = editingFeatureId;
         post('/dsh-cam/feature', body)
@@ -1309,15 +1393,24 @@ window.__ModuleLoader__.load({
               setEditingFeatureId(null);
               setAnnotating(false);
               setModelSelected(null);
+              setModelSelectedSet([]);
+              setSimilarPrompt(null);
             } else setErr(d.error || '标注写入失败');
           })
           .catch((e) => setErr(String(e)))
           .finally(() => setBusy(false));
-      }, [post, modelFile, modelSelected, featureName, featureNote, editingFeatureId]);
+      }, [post, modelFile, modelSelected, modelSelectedSet, similarPrompt, featureName, featureNote, editingFeatureId]);
 
       // 从已有标注列表开始「二次修改」（重命名 / 改备注 / 重选目标）
       const startEditFeature = React.useCallback((f) => {
         setModelSelected({ kind: f.kind, id: f.refId });
+        // 批量特征：恢复多选集合，让「已选 N 个」与高亮一致
+        if (Array.isArray(f.refIds) && f.refIds.length > 1) {
+          setModelSelectedSet(f.refIds.map((id) => ({ kind: f.kind, id })));
+        } else {
+          setModelSelectedSet([]);
+        }
+        setSimilarPrompt(null);
         setFeatureName(f.name || '');
         setFeatureNote(f.note || '');
         setEditingFeatureId(f.id);
@@ -1741,7 +1834,7 @@ window.__ModuleLoader__.load({
                             h('span', { style: { fontSize: 12, color: '#f97316' } }, f.kind === 'face' ? '▨' : '╱'),
                             h('div', { style: { display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1 } },
                               h('span', { style: { fontWeight: 600, color: 'var(--dsw-alias-label-primary, #111)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, f.name),
-                              h('span', { style: { fontSize: 10, color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, (f.kind === 'face' ? '面' : '边') + ' #' + f.refId + (f.note ? ' · ' + f.note : ''))),
+                              h('span', { style: { fontSize: 10, color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, (f.kind === 'face' ? '面' : '边') + ' #' + f.refId + (Array.isArray(f.refIds) && f.refIds.length > 1 ? ' ×' + f.refIds.length : '') + (f.note ? ' · ' + f.note : ''))),
                             h('button', {
                               onClick: () => removeFeature(f),
                               title: '删除此标注',
@@ -1751,14 +1844,23 @@ window.__ModuleLoader__.load({
                   // 右侧：模型视窗 + 轴心 + 标注输入
                   h('div', { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' } },
                     h(ModelViewer3D, {
-                      scene: modelScene, selected: modelSelected, pivot: modelPivot, features: modelFeatures, locate: locateTarget,
+                      scene: modelScene, selected: modelSelected, selectedSet: modelSelectedSet, pivot: modelPivot, features: modelFeatures, locate: locateTarget,
                       transform: mainTransform,
                       maximized: modelMaximized,
                       onToggleMaximize: () => setModelMaximized((v) => !v),
                       overlays: assets.filter((a) => assetScenes[a.id]).map((a) => ({ asset: a, scene: assetScenes[a.id] })),
-                      onSelect: (sel) => { setModelSelected(sel); setAnnotating(false); },
+                      onSelect: (sel) => {
+                        applySelection(sel, false);
+                        detectSimilar(sel.kind, sel.id);
+                      },
+                      onSelectMulti: (sel) => {
+                        // Shift+点击：切换多选；不触发相同特征弹窗（多选本身就是手动选择）
+                        applySelection(sel, true);
+                        setSimilarPrompt(null);
+                      },
                       onAnnotate: (sel) => {
                         setModelSelected(sel);
+                        setModelSelectedSet([sel]);
                         setFeatureName('');
                         setFeatureNote('');
                         setEditingFeatureId(null);
@@ -1809,16 +1911,39 @@ window.__ModuleLoader__.load({
                       h('div', { style: { display: 'flex', gap: 6 } },
                         h('button', { style: btnPrimary, onClick: applyMainTransform }, '应用到位'),
                         h('button', { style: btn, onClick: resetMainTransform }, '复位'))),
+                    // 相同特征提示：检测到当前面/边有 N 个相同特征，可一键一起标注
+                    similarPrompt && !annotating
+                      ? h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, padding: 8, marginTop: 6, borderRadius: 8, background: 'rgba(245,158,11,0.12)', border: '1px solid rgba(245,158,11,0.4)' } },
+                          h('span', { style: { flex: 1, fontSize: 11, color: '#92400e' } },
+                            '检测到当前' + (similarPrompt.kind === 'face' ? '面' : '边') + '有 ' + similarPrompt.count + ' ' + similarPrompt.label + '，是否一起标注？'),
+                          h('button', {
+                            onClick: () => {
+                              // 一起标注：把相同特征全部加入选中集合，并直接进入命名态
+                              const all = similarPrompt.ids.map((id) => ({ kind: similarPrompt.kind, id }));
+                              setModelSelectedSet(all);
+                              setModelSelected((similarPrompt.kind === 'face'
+                                ? modelScene.faces.find((x) => x.id === similarPrompt.ids[0])
+                                : modelScene.edges.find((x) => x.id === similarPrompt.ids[0])) || { kind: similarPrompt.kind, id: similarPrompt.ids[0] });
+                              setFeatureName('');
+                              setFeatureNote('');
+                              setEditingFeatureId(null);
+                              setAnnotating(true);
+                            },
+                            style: { ...btnPrimary, fontSize: 11, padding: '3px 10px' },
+                          }, '一起标注'),
+                          h('button', { onClick: () => setSimilarPrompt(null), style: { ...btn, fontSize: 11, padding: '3px 10px' } }, '忽略'))
+                      : null,
                     modelSelected && annotating
                       ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, padding: 8, marginTop: 6, borderRadius: 8, background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)', border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)' } },
                           h('div', { style: { fontSize: 11, fontWeight: 600, color: 'var(--dsw-alias-label-primary, #111)' } },
-                            (editingFeatureId ? '修改加工位置' : (modelSelected.kind === 'face' ? '标注加工面' : '标注加工边线')) + ' · 已选 #' + modelSelected.id),
+                            (editingFeatureId ? '修改加工位置' : (modelSelected.kind === 'face' ? '标注加工面' : '标注加工边线')) + ' · 已选 #' + modelSelected.id
+                            + (modelSelectedSet.length > 1 ? '（共 ' + modelSelectedSet.length + ' 个）' : '')),
                           h('div', { style: { display: 'flex', gap: 6 } },
                             h('input', { style: input, value: featureName, placeholder: '加工位置名称（必填）', onChange: (e) => setFeatureName(e.target.value), onKeyDown: (e) => { if (e.key === 'Enter') addFeature(); } }),
                             h('input', { style: input, value: featureNote, placeholder: '备注（可选，如钻孔/铣面）', onChange: (e) => setFeatureNote(e.target.value), onKeyDown: (e) => { if (e.key === 'Enter') addFeature(); } })),
                           h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
                             h('button', { style: btnPrimary, onClick: addFeature, disabled: busy }, editingFeatureId ? '保存修改' : '写入识别文件'),
-                            h('button', { style: btn, onClick: () => { setModelSelected(null); setAnnotating(false); setEditingFeatureId(null); } }, '取消')))
+                            h('button', { style: btn, onClick: () => { setModelSelected(null); setModelSelectedSet([]); setAnnotating(false); setEditingFeatureId(null); setSimilarPrompt(null); } }, '取消')))
                       : null,
                     // ---- 上传夹具 / 毛坯（供 AI 了解夹持与毛坯形状） ----
                     !setupCollapsed && h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, padding: 8, marginTop: 8, borderRadius: 8, background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)', border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)' } },

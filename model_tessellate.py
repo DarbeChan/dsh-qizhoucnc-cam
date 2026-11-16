@@ -5,18 +5,18 @@ Reuses the FreeCAD dependency already required by qizhouCNC_CAM: each solid
 face is tessellated into its own triangle list (so the client can pick faces),
 and every edge is discretized into a polyline (so the client can pick edges).
 
-Compatibility fixes for picking (v1.3.14):
-- A full cylinder / cone / sphere / torus surface is often exported by CAD
-  kernels as TWO half surfaces (split at the periodic seam), so clicking the
-  inner/outer round wall felt like "it splits into two halves". Identical
-  periodic faces are merged back into one pickable face.
-- A full circle edge is likewise often split into two semicircle edges; they
-  are merged back into one closed loop so double-clicking a round edge selects
-  the whole circle.
+Two distinct per-element keys are emitted:
+- a position-aware "merge key" (internal) — merges periodic surfaces split at
+  their seam (half cylinder/cone/sphere/torus) and half-circle edges back into
+  one pickable element. It MUST include position so two parallel holes never
+  merge (v1.3.15 fix).
+- a position-INVARIANT "shapeKey" (emitted to the client) — groups faces/edges
+  that are the same FEATURE (e.g. four holes of the same diameter, or several
+  equal-size slots). The client uses it to offer "检测到 N 个相同特征，是否一起标注".
 
 Output JSON is written to <out_path> so stdout stays clean.
 """
-import os, sys, json, math
+import os, sys, json
 import FreeCAD, Part
 
 
@@ -29,8 +29,24 @@ def _pt(v):
     return [round(float(v.x), 5), round(float(v.y), 5), round(float(v.z), 5)]
 
 
+def _vec3(v):
+    return (_r(v.x), _r(v.y), _r(v.z))
+
+
+def _axis(f):
+    """Axis as a normalized 3-tuple, tolerant of the two half-surface axis directions
+    sometimes being negated relative to each other (still the same line)."""
+    a = f.Surface.Axis
+    ax = _vec3(a)
+    # canonicalize sign so +z and -z count as the same axis line
+    neg = tuple(-c for c in ax)
+    return ax if ax <= neg else neg
+
+
+# ---- position-aware merge keys (used only internally, to rejoin seam splits) ----
+
 def _surface_key(f):
-    """Stable identity key for periodic surfaces (cylinder/cone/sphere/torus).
+    """Identity of a periodic surface INCLUDING its position.
 
     Returns None for non-periodic surfaces (planes etc.), which are never merged.
     """
@@ -38,31 +54,76 @@ def _surface_key(f):
     t = type(s).__name__
     try:
         if t == 'Cylinder':
-            ax = s.Axis
-            return ('cyl', _r(ax.x), _r(ax.y), _r(ax.z), _r(s.Radius))
+            return ('cyl', _vec3(s.Center), _axis(f), _r(s.Radius))
         if t == 'Cone':
-            ax = s.Axis
-            return ('cone', _r(ax.x), _r(ax.y), _r(ax.z), _r(s.SemiAngle))
+            return ('cone', _vec3(s.Center), _vec3(s.Apex), _axis(f), _r(s.SemiAngle))
         if t == 'Sphere':
-            c = s.Center
-            return ('sph', _r(c.x), _r(c.y), _r(c.z), _r(s.Radius))
+            return ('sph', _vec3(s.Center), _r(s.Radius))
         if t == 'Toroid':
-            ax = s.Axis
-            return ('tor', _r(ax.x), _r(ax.y), _r(ax.z), _r(s.MajorRadius), _r(s.MinorRadius))
+            return ('tor', _vec3(s.Center), _axis(f), _r(s.MajorRadius), _r(s.MinorRadius))
     except Exception:
         return None
     return None
 
 
 def _circle_key(e):
-    """Stable identity key for circular edges, or None."""
+    """Identity of a circle edge INCLUDING its position, or None."""
     try:
         c = e.Curve
-        if not isinstance(c, Part.Circle):
-            return None
-        ct = c.Center
-        ax = c.Axis
-        return (_r(ct.x), _r(ct.y), _r(ct.z), _r(ax.x), _r(ax.y), _r(ax.z), _r(c.Radius))
+    except Exception:
+        return None
+    if c is None or not isinstance(c, Part.Circle):
+        return None
+    try:
+        return (_vec3(c.Center), _axis(e), _r(c.Radius))
+    except Exception:
+        return None
+
+
+# ---- position-INVARIANT shape keys (emitted; group identical features) ----
+
+def _face_shape_key(f):
+    """A position-independent signature of a face's FEATURE type.
+
+    Two faces with the same shapeKey are "the same feature" (same size/shape),
+    just at a different location — e.g. two 8mm drilled holes, or two equal
+    pockets. Periodic surfaces key on their dimension params; planar faces key
+    on perimeter + area (a reasonable same-size/same-shape signature).
+    """
+    s = f.Surface
+    t = type(s).__name__
+    try:
+        if t == 'Cylinder':
+            return 'cyl:r%.4f' % _r(s.Radius, 4)
+        if t == 'Cone':
+            return 'cone:r%.4f:a%.4f' % (_r(s.Radius, 4), _r(s.SemiAngle, 4))
+        if t == 'Sphere':
+            return 'sph:r%.4f' % _r(s.Radius, 4)
+        if t == 'Toroid':
+            return 'tor:R%.4f:r%.4f' % (_r(s.MajorRadius, 4), _r(s.MinorRadius, 4))
+        if t == 'Plane':
+            perim = sum(float(w.Length) for w in f.Wires)
+            return 'plane:p%.3f:a%.3f' % (_r(perim, 3), _r(f.Area, 3))
+    except Exception:
+        pass
+    return None
+
+
+def _edge_shape_key(e):
+    """A position-independent signature of an edge's FEATURE type."""
+    try:
+        c = e.Curve
+    except Exception:
+        return None
+    if c is None:
+        return None
+    t = type(c).__name__
+    try:
+        if t == 'Circle':
+            return 'circle:r%.4f' % _r(c.Radius, 4)
+        if t == 'Line':
+            return 'line:l%.3f' % _r(e.Length, 3)
+        return 'edge:%s' % t
     except Exception:
         return None
 
@@ -79,7 +140,6 @@ def _discretize_full_circle(curve, tol):
             return None
     if not pts or len(pts) < 3:
         return None
-    # ensure closed: repeat first point at the end
     return [_pt(p) for p in pts] + [_pt(pts[0])]
 
 
@@ -88,9 +148,9 @@ def run(model_path, out_path, tol=0.1):
     if shape is None:
         raise RuntimeError("Could not read model: " + model_path)
 
-    # ---- 1) tessellate every face, remembering its surface identity ----
-    raw_faces = []  # (surface_key, face_dict)
-    for i, f in enumerate(shape.Faces):
+    # ---- 1) tessellate every face, remembering merge key + shape key ----
+    raw_faces = []
+    for f in shape.Faces:
         try:
             verts, tris = f.tessellate(tol)
         except Exception:
@@ -114,11 +174,10 @@ def run(model_path, out_path, tol=0.1):
             "triangles": [[int(t[0]), int(t[1]), int(t[2])] for t in tris],
             "center": center,
             "area": round(area, 3),
+            "shapeKey": _face_shape_key(f),
         }))
 
     # ---- 2) merge identical periodic faces (split cylinder/cone/sphere/torus) ----
-    # Only merge when >1 face shares a periodic identity (a genuine split);
-    # a single face is left untouched.
     buckets = {}
     order = []
     for key, fd in raw_faces:
@@ -142,11 +201,11 @@ def run(model_path, out_path, tol=0.1):
             faces.append({"id": fid, **group[0]})
             fid += 1
             continue
-        # merge several half-surfaces into one face
         vertices = []
         triangles = []
         total_area = 0.0
         wcenter = [0.0, 0.0, 0.0]
+        shape_key = group[0].get("shapeKey")
         for g in group:
             off = len(vertices)
             vertices.extend(g["vertices"])
@@ -167,11 +226,12 @@ def run(model_path, out_path, tol=0.1):
             "triangles": triangles,
             "center": wcenter,
             "area": round(total_area, 3),
+            "shapeKey": shape_key,
         })
         fid += 1
 
-    # ---- 3) discretize every edge, remembering its circle identity ----
-    raw_edges = []  # (circle_key, points)
+    # ---- 3) discretize every edge, remembering merge key + shape key ----
+    raw_edges = []
     for e in shape.Edges:
         key = _circle_key(e)
         try:
@@ -183,33 +243,33 @@ def run(model_path, out_path, tol=0.1):
                 continue
         if not pts or len(pts) < 2:
             continue
-        raw_edges.append((key, [_pt(p) for p in pts]))
+        raw_edges.append((key, [_pt(p) for p in pts], _edge_shape_key(e)))
 
     # ---- 4) merge identical circle edges (split semicircles) into one loop ----
     ebuckets = {}
     eorder = []
-    for key, pts in raw_edges:
+    for key, pts, skey in raw_edges:
         if key is None:
-            eorder.append(('solo', pts))
+            eorder.append(('solo', pts, skey))
             continue
         if key not in ebuckets:
             ebuckets[key] = []
             eorder.append(('circle', key))
-        ebuckets[key].append(pts)
+        ebuckets[key].append((pts, skey))
 
     edges = []
     eid = 1
-    for kind, payload in eorder:
+    for kind, payload, *rest in eorder:
         if kind == 'solo':
-            edges.append({"id": eid, "points": payload})
+            edges.append({"id": eid, "points": payload, "shapeKey": rest[0]})
             eid += 1
             continue
         group = ebuckets[payload]
+        skey = group[0][1]
         if len(group) == 1:
-            edges.append({"id": eid, "points": group[0]})
+            edges.append({"id": eid, "points": group[0][0], "shapeKey": skey})
             eid += 1
             continue
-        # re-discretize as one full circle using the first member's curve
         curve = None
         for e in shape.Edges:
             if _circle_key(e) == payload:
@@ -217,13 +277,12 @@ def run(model_path, out_path, tol=0.1):
                 break
         merged = _discretize_full_circle(curve, tol) if curve is not None else None
         if merged is None:
-            # fallback: concatenate the half loops (dedup endpoints)
             merged = []
-            for pts in group:
+            for pts, _ in group:
                 for p in pts:
                     if not merged or merged[-1] != p:
                         merged.append(p)
-        edges.append({"id": eid, "points": merged})
+        edges.append({"id": eid, "points": merged, "shapeKey": skey})
         eid += 1
 
     bb = shape.BoundBox

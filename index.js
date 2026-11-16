@@ -395,16 +395,22 @@ function saveFeatures(features) {
     writeFileSync(FEATURE_FILE, JSON.stringify(features, null, 2), 'utf8');
   } catch { /* ignore */ }
 }
-// append a named machining feature, keyed by model path; returns the updated list
+// append a named machining feature, keyed by model path; returns the updated list.
+// Supports batch annotate: feature.refIds (array) creates ONE feature record that
+// points at multiple faces/edges (e.g. "4 个 Φ8 孔" 一起标注)，feature.refId 为单个。
 function appendFeature(modelPath, feature) {
   const p = resolvePath(modelPath);
   const all = loadFeatures();
   const list = Array.isArray(all[p]) ? all[p] : [];
+  const refIds = Array.isArray(feature.refIds)
+    ? feature.refIds.map((n) => Number(n) || 0).filter((n) => n > 0)
+    : [];
   const item = {
     id: feature.id ?? (Date.now().toString(36) + Math.random().toString(36).slice(2, 6)),
     name: String(feature.name ?? '未命名'),
     kind: feature.kind === 'edge' ? 'edge' : 'face',
-    refId: Number(feature.refId) || 0,
+    refId: refIds.length ? refIds[0] : (Number(feature.refId) || 0),
+    ...(refIds.length ? { refIds } : {}),
     note: String(feature.note ?? ''),
     createdAt: feature.createdAt ?? new Date().toISOString(),
   };
@@ -422,13 +428,22 @@ function updateFeature(modelPath, feature) {
   const idx = list.findIndex((x) => x && x.id === feature.id);
   if (idx < 0) return list;
   const cur = list[idx];
-  list[idx] = {
+  const refIds = Array.isArray(feature.refIds)
+    ? feature.refIds.map((n) => Number(n) || 0).filter((n) => n > 0)
+    : (Array.isArray(cur.refIds) ? cur.refIds : null);
+  const next = {
     ...cur,
     name: feature.name !== undefined ? String(feature.name) : cur.name,
     note: feature.note !== undefined ? String(feature.note) : cur.note,
     kind: feature.kind === 'edge' ? 'edge' : (feature.kind === 'face' ? 'face' : cur.kind),
     refId: feature.refId !== undefined ? Number(feature.refId) : cur.refId,
   };
+  if (refIds && refIds.length > 1) {
+    next.refIds = refIds;
+  } else {
+    delete next.refIds;
+  }
+  list[idx] = next;
   all[p] = list;
   saveFeatures(all);
   return list;
