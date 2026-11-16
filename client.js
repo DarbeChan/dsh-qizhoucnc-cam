@@ -314,9 +314,8 @@ window.__ModuleLoader__.load({
     // scene 来自 /dsh-cam/model：{ bounds:{min,max}, faces:[{id,vertices,triangles,center,area}], edges:[{id,points}] }
     // selected: { kind:'face'|'edge', id } | null；点击面/边时回传 onSelect。
     // pivot: [x,y,z] 旋转轴心；默认取模型包围盒中心。旋转/缩放都围绕该点。
-    function ModelViewer3D({ scene, selected, onSelect, onAnnotate, pivot, features, locate, overlays, transform }) {
+    function ModelViewer3D({ scene, selected, onSelect, onAnnotate, pivot, features, locate, overlays, transform, maximized, onToggleMaximize }) {
       const [view, setView] = React.useState(null);
-      const [maximized, setMaximized] = React.useState(false); // 放大模型视窗（全屏遮罩）
       const drag = React.useRef(null);
       // 单击/双击判定：记录上次点击的目标与时间（同目标 350ms 内再次点击 = 双击标注）
       const clickState = React.useRef({ time: 0, kind: null, id: null });
@@ -672,7 +671,7 @@ window.__ModuleLoader__.load({
 
       // 最大化按钮 + 恢复按钮（模型视窗放大/还原）
       const maxBtn = h('button', {
-        onClick: () => setMaximized((v) => !v),
+        onClick: () => (typeof onToggleMaximize === 'function' ? onToggleMaximize() : null),
         title: maximized ? '还原模型视窗大小' : '放大模型视窗（全屏操作）',
         style: {
           marginLeft: 'auto', padding: '1px 8px', fontSize: 11, cursor: 'pointer', borderRadius: 5,
@@ -696,35 +695,6 @@ window.__ModuleLoader__.load({
         h('g', null, faceEls),
         h('g', null, edgeEls),
         h('g', null, overlayEls));
-
-      // 放大：全屏遮罩里显示更大的模型视窗
-      if (maximized) {
-        return h('div', {
-          style: {
-            position: 'fixed', inset: 0, zIndex: 3100,
-            background: 'rgba(15, 23, 42, 0.6)',
-            display: 'flex', flexDirection: 'column', padding: 18,
-          },
-          onClick: () => setMaximized(false),
-        },
-          h('div', {
-            style: {
-              flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: 6,
-              background: 'var(--dsw-alias-bg-base, #fff)', borderRadius: 12, padding: 12,
-              boxShadow: '0 24px 80px rgba(0,0,0,0.45)',
-            },
-            onClick: (e) => e.stopPropagation(),
-          },
-            h('div', { style: { display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' } },
-              h('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', marginRight: 2, fontWeight: 600 } }, '模型视窗'),
-              VIEWS.map((v) => viewBtn(v, activeView === v)),
-              maxBtn),
-            svgBlock({ flex: 1, minHeight: 0 }),
-            h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 } },
-              h('span', { style: { flex: 1, color: selected ? 'var(--dsw-alias-brand-primary, #2563eb)' : 'var(--dsw-alias-label-tertiary, #9ca3af)', fontWeight: selected ? 600 : 400 } }, selText),
-              h('span', { style: { color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } },
-                '拖拽=旋转 · Shift/右键=平移 · 滚轮=缩放 · 面 ' + scene.faces.length + ' · 边 ' + scene.edges.length))));
-      }
 
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minHeight: 0 } },
         h('div', { style: { display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' } },
@@ -1047,6 +1017,8 @@ window.__ModuleLoader__.load({
       // 版本更新检查（右下角：版本号 / 更新提醒 / 手动更新）
       const [versionInfo, setVersionInfo] = React.useState(null); // { current, latest, updateAvailable }
       const [updating, setUpdating] = React.useState(false); // 是否正在执行更新
+      // 模型视窗放大（全屏遮罩显示整个模型操作区：标注列表 + 视窗 + 轴心 + 设置面板 + 标注输入 + 夹具/毛坯）
+      const [modelMaximized, setModelMaximized] = React.useState(false);
       // 底部设置区（主体零件位移/旋转 + 夹具/毛坯）折叠/展开
       const [setupCollapsed, setSetupCollapsed] = React.useState(false);
       // FreeCAD 自动下载状态（未安装 FreeCAD 时展示进度并触发下载）
@@ -1728,7 +1700,31 @@ window.__ModuleLoader__.load({
           h('div', { style: { flex: 1, overflow: 'hidden', padding: 10, display: 'flex', flexDirection: 'column', minHeight: 0 } },
             err ? h('div', { style: { padding: 8, color: 'var(--dsw-alias-state-error-primary, #dc2626)', fontSize: 12, marginBottom: 8 } }, '错误：' + err) : null,
             viewMode === 'model'
-              ? h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'row', gap: 8 } },
+              ? h('div', {
+                  style: {
+                    flex: 1, minHeight: 0, display: 'flex', flexDirection: 'row', gap: 8,
+                    // 放大：把整个模型操作区（标注列表 + 视窗 + 轴心 + 设置面板 + 标注输入 + 夹具/毛坯）
+                    // 原样铺到全屏，布局保持不变；position:fixed 相对视口定位，不受面板 overflow 裁剪。
+                    ...(modelMaximized ? {
+                      position: 'fixed', inset: 0, zIndex: 3100,
+                      background: 'var(--dsw-alias-bg-base, #fff)',
+                      padding: 16, boxShadow: '0 24px 80px rgba(0,0,0,0.35)',
+                    } : {}),
+                  },
+                },
+                  // 放大态：右上角浮动「还原」按钮 + 顶部标题条（点击遮罩语义一致）
+                  modelMaximized ? h('div', {
+                    style: {
+                      position: 'absolute', top: 12, right: 12, zIndex: 3101,
+                      display: 'flex', alignItems: 'center', gap: 8,
+                    },
+                  },
+                    h('span', { style: { fontSize: 13, fontWeight: 600, color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, '模型视窗 · 放大'),
+                    h('button', {
+                      onClick: () => setModelMaximized(false),
+                      style: { ...btn, fontSize: 12, padding: '3px 12px', fontWeight: 600 },
+                      title: '还原模型视窗',
+                    }, '还原')) : null,
                   // 左侧：已标注加工位置列表
                   h('div', { style: { width: 168, flexShrink: 0, display: 'flex', flexDirection: 'column', borderRadius: 8, background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)', border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', padding: 8, overflow: 'hidden' } },
                     h('div', { style: { fontSize: 11, fontWeight: 700, color: 'var(--dsw-alias-label-primary, #111)', marginBottom: 4 } }, '已标注加工位置'),
@@ -1757,6 +1753,8 @@ window.__ModuleLoader__.load({
                     h(ModelViewer3D, {
                       scene: modelScene, selected: modelSelected, pivot: modelPivot, features: modelFeatures, locate: locateTarget,
                       transform: mainTransform,
+                      maximized: modelMaximized,
+                      onToggleMaximize: () => setModelMaximized((v) => !v),
                       overlays: assets.filter((a) => assetScenes[a.id]).map((a) => ({ asset: a, scene: assetScenes[a.id] })),
                       onSelect: (sel) => { setModelSelected(sel); setAnnotating(false); },
                       onAnnotate: (sel) => {
