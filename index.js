@@ -6,6 +6,7 @@ import { tmpdir, homedir } from 'node:os';
 import { join, dirname, basename, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureFreecadDownload, freecadInstallStatus, portableFreecadBin } from './freecad_install.js';
+import { mountCommand } from './command.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // 默认 FreeCAD 路径（macOS）。其它机器可经插件设置覆盖 freecadBin。
@@ -30,6 +31,65 @@ let latestToolpath = null;
 // DSH-modified .nc files per session, surfaced to the client for a quick jump (feature 3).
 // sessionId -> { seq, files: [{ path(absolute), display, added, deleted }] }
 let changedNcFiles = {};
+
+// ---- 版本更新检查（面板右下角：版本号 + 更新提醒 + 手动点击更新） ----
+const PKG_NAME = 'dsh-qizhoucnc-cam';
+
+// 读取本插件 package.json 里的 version（开发期是本地 dev 包，发布后是 npm 安装包，同一份清单）。
+function readOwnPackage() {
+  try {
+    const m = JSON.parse(readFileSync(join(__dirname, 'package.json'), 'utf8'));
+    return { name: typeof m.name === 'string' ? m.name : null, version: typeof m.version === 'string' && m.version ? m.version : null };
+  } catch { return { name: null, version: null }; }
+}
+function readOwnVersion() {
+  return readOwnPackage().version;
+}
+
+// 解析版本号的主版本段（x.y.z 的前导数字），忽略 -beta/-rc 等后缀。
+function parseVersion(v) {
+  const m = String(v || '').trim().match(/^\d+(?:\.\d+)*/);
+  if (!m) return null;
+  return m[0].split('.').map((n) => parseInt(n, 10) || 0);
+}
+
+// 返回 >0 表示 a 比 b 新；<0 表示 a 比 b 旧；0 表示相等或无法比较。
+function compareVersions(a, b) {
+  const pa = parseVersion(a), pb = parseVersion(b);
+  if (!pa || !pb) return 0;
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const x = pa[i] || 0, y = pb[i] || 0;
+    if (x !== y) return x > y ? 1 : -1;
+  }
+  return 0;
+}
+
+// 查询 npm registry 最新版本（官方源 + 国内镜像回退，缓存 1 小时）。
+let versionCache = { at: 0, latest: null };
+async function fetchNpmLatest() {
+  if (Date.now() - versionCache.at < 60 * 60 * 1000 && versionCache.latest) return versionCache.latest;
+  const urls = [
+    'https://registry.npmjs.org/' + PKG_NAME,
+    'https://registry.npmmirror.com/' + PKG_NAME,
+  ];
+  for (const url of urls) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 12000);
+      const res = await fetch(url, { signal: ctrl.signal, headers: { accept: 'application/json' } });
+      clearTimeout(timer);
+      if (!res.ok) continue;
+      const data = await res.json();
+      const latest = data && data['dist-tags'] && data['dist-tags'].latest;
+      if (typeof latest === 'string' && latest) {
+        versionCache = { at: Date.now(), latest };
+        return latest;
+      }
+    } catch { /* 尝试下一个源 */ }
+  }
+  return versionCache.latest; // 全部失败：返回上次成功值（可能为 null）
+}
 
 function resolvePath(p) {
   return isAbsolute(p) ? p : resolve(process.cwd(), p);
@@ -832,6 +892,33 @@ export function apply(ctx, config = {}) {
         }
       },
     }));
+
+    // 版本更新检查（GET：本插件版本 + npm 最新版本 + 是否有更新）。
+    // 实际的「点击更新」由客户端直接调用 dshmarket 的公共更新 API 完成，
+    // 因为该 API 需要浏览器会话 cookie（同源保护），宿主进程拿不到。
+    // 只有以 npm 包名 dsh-qizhoucnc-cam 安装时，市场更新 API 才能定位并更新它；
+    // 本地 file:/link: 开发包（@local/dsh-cam）返回 updatable:false，客户端只显示版本号。
+    routeDisposers.push(server.register({
+      kind: 'prefix',
+      path: '/dsh-cam/version',
+      handler: async (req, res) => {
+        try {
+          const pkg = readOwnPackage();
+          const current = pkg.version;
+          const pkgName = pkg.name;
+          // 只有以 npm 包名安装的副本才可经市场更新 API 更新。
+          const updatable = pkgName === PKG_NAME;
+          let latest = null;
+          if (updatable) {
+            try { latest = await fetchNpmLatest(); } catch { /* 网络失败则 latest 为 null */ }
+          }
+          const updateAvailable = updatable && latest && current ? compareVersions(latest, current) > 0 : false;
+          send(res, { ok: true, pkgName: pkgName || '', current: current || '1.0.0', latest, updateAvailable, updatable });
+        } catch (e) {
+          send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
+        }
+      },
+    }));
   };
   ensureRoutes();
   const retry = setInterval(() => { if (routeDisposers.length === 0) ensureRoutes(); }, 100);
@@ -947,11 +1034,27 @@ export function apply(ctx, config = {}) {
   });
 
   const disposers = [ctx.tools.register(camGenerate), ctx.tools.register(camLoad), ctx.tools.register(camRender)];
+
+  // 斜杠命令 /dsh-qizhoucnc-cam：可带 STEP 模型附件，把「生成/查看刀路」请求注入给模型。
+  // commands 是可选服务，缺失时 mountCommand 静默降级为 no-op。
+  let disposeCommand = () => {};
+  try {
+    if (typeof ctx.inject === 'function') {
+      ctx.inject(['commands'], (host) => {
+        disposeCommand = mountCommand(host);
+        return disposeCommand;
+      });
+    } else if (ctx.commands && typeof ctx.commands.register === 'function') {
+      disposeCommand = mountCommand(ctx);
+    }
+  } catch { /* 斜杠命令不可用则跳过，不影响工具本身 */ }
+
   ctx.effect(() => () => {
     clearInterval(retry);
     disposers.forEach((d) => d());
     routeDisposers.forEach((d) => d());
     routeDisposers = [];
+    disposeCommand();
     unlistenChanges();
   });
 

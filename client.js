@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-  id: 'dsh-qizhoucnc-cam',
+  id: '@local/dsh-cam',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
@@ -53,6 +53,50 @@ window.__ModuleLoader__.load({
       const cp = Math.cos(pitch), sp = Math.sin(pitch);
       const y2 = y1 * cp + z * sp;
       return [x1, -y2]; // screen: X right, Y up (CNC Z-up)
+    }
+
+    // 未绕俯仰/偏航的完整 3D 旋转（用于「视线深度」计算：越靠近视点的点深度越小）。
+    // 与 project3d 的前两步一致，只是保留 z（viewer 的视线沿 z 轴负向）。
+    function rotateView(p, yaw, pitch) {
+      const [x, y, z] = p;
+      const cy = Math.cos(yaw), sy = Math.sin(yaw);
+      const x1 = x * cy - y * sy;
+      const y1 = x * sy + y * cy;
+      const cp = Math.cos(pitch), sp = Math.sin(pitch);
+      const y2 = y1 * cp + z * sp;
+      const z2 = -y1 * sp + z * cp;
+      return [x1, y2, z2];
+    }
+
+    // 点在三角形内的重心坐标（屏幕 2D）。命中返回 {u,v,w}（对应 a,b,c 三顶点），否则 null。
+    function barycentric(px, py, ax, ay, bx, by, cx2, cy2) {
+      const v0x = cx2 - ax, v0y = cy2 - ay;
+      const v1x = bx - ax, v1y = by - ay;
+      const v2x = px - ax, v2y = py - ay;
+      const d00 = v0x * v0x + v0y * v0y;
+      const d01 = v0x * v1x + v0y * v1y;
+      const d11 = v1x * v1x + v1y * v1y;
+      const d20 = v2x * v0x + v2y * v0y;
+      const d21 = v2x * v1x + v2y * v1y;
+      const denom = d00 * d11 - d01 * d01;
+      if (Math.abs(denom) < 1e-12) return null;
+      const w = (d11 * d20 - d01 * d21) / denom;
+      const v = (d00 * d21 - d01 * d20) / denom;
+      const u = 1 - v - w;
+      if (u >= -1e-6 && v >= -1e-6 && w >= -1e-6) return { u, v, w };
+      return null;
+    }
+
+    // 点到线段的（平方）屏幕距离。
+    function pointSegDistSq(px, py, ax, ay, bx, by) {
+      const dx = bx - ax, dy = by - ay;
+      const l2 = dx * dx + dy * dy;
+      if (l2 < 1e-12) { const ex = px - ax, ey = py - ay; return ex * ex + ey * ey; }
+      let t = ((px - ax) * dx + (py - ay) * dy) / l2;
+      t = Math.max(0, Math.min(1, t));
+      const cx = ax + t * dx, cy = ay + t * dy;
+      const ex = px - cx, ey = py - cy;
+      return ex * ex + ey * ey;
     }
 
     // 夹具/毛坯位姿：对点先绕 Z/Y/X 旋转（度），再平移（mm）。
@@ -272,10 +316,12 @@ window.__ModuleLoader__.load({
     // pivot: [x,y,z] 旋转轴心；默认取模型包围盒中心。旋转/缩放都围绕该点。
     function ModelViewer3D({ scene, selected, onSelect, onAnnotate, pivot, features, locate, overlays, transform }) {
       const [view, setView] = React.useState(null);
+      const [maximized, setMaximized] = React.useState(false); // 放大模型视窗（全屏遮罩）
       const drag = React.useRef(null);
       // 单击/双击判定：记录上次点击的目标与时间（同目标 350ms 内再次点击 = 双击标注）
       const clickState = React.useRef({ time: 0, kind: null, id: null });
       const clickTimer = React.useRef(null);
+      const svgRef = React.useRef(null);
       const W = 600, H = 460, cx = W / 2, cy = H / 2;
       const pv = pivot || [0, 0, 0];
       // 主体模型的位移/旋转（与夹具/毛坯同款 transform）：{ translate:[x,y,z], rotate:[rx,ry,rz] }
@@ -293,6 +339,14 @@ window.__ModuleLoader__.load({
         const q = xf ? applyAssetTransform(p, xf) : p;
         const [sx, sy] = project3d([q[0] - tpv[0], q[1] - tpv[1], q[2] - tpv[2]], view.yaw, view.pitch);
         return [cx + sx * view.zoom + view.panX, cy + sy * view.zoom + view.panY];
+      }, [view, tpv[0], tpv[1], tpv[2], xf]);
+
+      // 视空间：返回 [screenX, screenY, depth]。depth 沿视线（越大 = 越靠前/越靠近视点）。
+      // 用于「最前面」几何拾取：命中多个面时取 depth 最大的那个。
+      const toView = React.useCallback((p) => {
+        const q = xf ? applyAssetTransform(p, xf) : p;
+        const [sx, sy, sz] = rotateView([q[0] - tpv[0], q[1] - tpv[1], q[2] - tpv[2]], view.yaw, view.pitch);
+        return [cx + sx * view.zoom + view.panX, cy + sy * view.zoom + view.panY, sz];
       }, [view, tpv[0], tpv[1], tpv[2], xf]);
 
       // fit the whole model into the viewport for a given yaw/pitch (relative to pivot)
@@ -476,17 +530,65 @@ window.__ModuleLoader__.load({
         }
       }
 
-      // 命中测试：从指针下的元素向上找带 data-hit 的面/边（渲染时已给每个 path/polyline 打 data-hit/data-id）。
+      // 命中测试：几何拾取「最前面的」面/边（不再用 DOM elementFromPoint 的绘制顺序，
+      // 那是数组顺序，会选中被画在后面的背面）。核心思想：
+      //   1) 把屏幕坐标反算回 SVG 视口坐标（考虑缩放后的 viewBox 映射与 CSS 缩放）；
+      //   2) 遍历所有面，做三角形重心坐标命中 + 视空间深度插值，取深度最大（最靠前）者；
+      //   3) 若没有命中面，再按屏幕距离最近选边（容差 ~8px）。
       const hitTest = (clientX, clientY) => {
-        if (typeof document === 'undefined') return null;
-        let node = document.elementFromPoint(clientX, clientY);
-        while (node && node !== document.body && node !== document.documentElement) {
-          const hk = node.getAttribute && node.getAttribute('data-hit');
-          if (hk === 'face' || hk === 'edge') {
-            const id = Number(node.getAttribute('data-id'));
-            return { kind: hk, id };
+        // 视口坐标：SVG 用 viewBox 0 0 600 460 + width/height 100%，需反算 CSS 缩放。
+        let px = clientX, py = clientY, unit = 1;
+        const svg = svgRef.current;
+        if (svg && typeof svg.getBoundingClientRect === 'function') {
+          const r = svg.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) {
+            px = (clientX - r.left) * (W / r.width);
+            py = (clientY - r.top) * (H / r.height);
+            unit = W / r.width; // 屏幕 px → 视口单位
           }
-          node = node.parentNode;
+        }
+        let best = null;         // { kind, id, depth }
+        let bestDistSq = Infinity; // 边缘命中用
+
+        // 面：三角重心坐标命中 + 深度插值（屏幕坐标 + 视空间深度同时插值）。
+        if (scene && Array.isArray(scene.faces)) {
+          for (const f of scene.faces) {
+            const v = f.vertices;
+            const tris = f.triangles;
+            if (!v || !tris) continue;
+            for (const tri of tris) {
+              const a = v[tri[0]], b = v[tri[1]], c = v[tri[2]];
+              if (!a || !b || !c) continue;
+              const [ax, ay] = toScreen(a), [bx, by] = toScreen(b), [cx2, cy2] = toScreen(c);
+              const bc = barycentric(px, py, ax, ay, bx, by, cx2, cy2);
+              if (!bc) continue;
+              // 深度：view 空间 z（越大越靠前）按重心插值
+              const depth = toView(a)[2] * bc.u + toView(b)[2] * bc.v + toView(c)[2] * bc.w;
+              if (!best || best.kind !== 'face' || depth > best.depth) {
+                best = { kind: 'face', id: f.id, depth };
+              }
+            }
+          }
+        }
+        if (best) return { kind: best.kind, id: best.id };
+
+        // 边：屏幕距离最近者（容差 8 视口单位）。
+        const tolPx = 8 * unit;
+        let bestEdge = null;
+        if (scene && Array.isArray(scene.edges)) {
+          for (const e of scene.edges) {
+            const pts = e.points;
+            if (!pts || pts.length < 2) continue;
+            for (let i = 0; i < pts.length - 1; i++) {
+              const [ax, ay] = toScreen(pts[i]);
+              const [bx, by] = toScreen(pts[i + 1]);
+              const d2 = pointSegDistSq(px, py, ax, ay, bx, by);
+              if (d2 < bestDistSq) { bestDistSq = d2; bestEdge = e.id; }
+            }
+          }
+        }
+        if (bestEdge !== null && bestDistSq <= tolPx * tolPx) {
+          return { kind: 'edge', id: bestEdge };
         }
         return null;
       };
@@ -568,22 +670,69 @@ window.__ModuleLoader__.load({
         ? (selected.kind === 'face' ? '已选面 #' + selected.id + (selected.area ? ' · ' + Math.round(selected.area) + ' mm²' : '') : '已选边 #' + selected.id) + '（双击标注）'
         : '单击选中面或边线，双击标注加工位置';
 
+      // 最大化按钮 + 恢复按钮（模型视窗放大/还原）
+      const maxBtn = h('button', {
+        onClick: () => setMaximized((v) => !v),
+        title: maximized ? '还原模型视窗大小' : '放大模型视窗（全屏操作）',
+        style: {
+          marginLeft: 'auto', padding: '1px 8px', fontSize: 11, cursor: 'pointer', borderRadius: 5,
+          border: '1px solid ' + (maximized ? 'var(--dsw-alias-state-business-primary, #2563eb)' : 'var(--dsw-alias-border-l1, #e5e7eb)'),
+          background: maximized ? 'color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 12%, transparent)' : 'transparent',
+          color: maximized ? 'var(--dsw-alias-state-business-primary, #2563eb)' : 'var(--dsw-alias-label-primary, #111)',
+          fontWeight: maximized ? 600 : 400,
+        },
+      }, maximized ? '还原' : '⛶ 放大');
+
+      // SVG 视窗（普通内嵌或全屏遮罩共用同一份渲染逻辑）
+      const svgBlock = (style) => h('svg', {
+        ref: svgRef,
+        viewBox: '0 0 ' + W + ' ' + H, width: '100%', height: '100%',
+        style: { background: 'var(--dsw-alias-bg-base, #fff)', borderRadius: 8, border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', touchAction: 'none', cursor: 'grab', flex: 1, minHeight: 0, ...style },
+        onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp,
+        onWheel, onContextMenu: (e) => e.preventDefault(),
+      },
+        gridLines.map((g, i) => line(g, 'var(--dsw-alias-border-l1, #e5e7eb)', 0.5)),
+        axes.map((a, i) => line(a.pts, a.color, 1.2)),
+        h('g', null, faceEls),
+        h('g', null, edgeEls),
+        h('g', null, overlayEls));
+
+      // 放大：全屏遮罩里显示更大的模型视窗
+      if (maximized) {
+        return h('div', {
+          style: {
+            position: 'fixed', inset: 0, zIndex: 3100,
+            background: 'rgba(15, 23, 42, 0.6)',
+            display: 'flex', flexDirection: 'column', padding: 18,
+          },
+          onClick: () => setMaximized(false),
+        },
+          h('div', {
+            style: {
+              flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: 6,
+              background: 'var(--dsw-alias-bg-base, #fff)', borderRadius: 12, padding: 12,
+              boxShadow: '0 24px 80px rgba(0,0,0,0.45)',
+            },
+            onClick: (e) => e.stopPropagation(),
+          },
+            h('div', { style: { display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' } },
+              h('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', marginRight: 2, fontWeight: 600 } }, '模型视窗'),
+              VIEWS.map((v) => viewBtn(v, activeView === v)),
+              maxBtn),
+            svgBlock({ flex: 1, minHeight: 0 }),
+            h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 } },
+              h('span', { style: { flex: 1, color: selected ? 'var(--dsw-alias-brand-primary, #2563eb)' : 'var(--dsw-alias-label-tertiary, #9ca3af)', fontWeight: selected ? 600 : 400 } }, selText),
+              h('span', { style: { color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } },
+                '拖拽=旋转 · Shift/右键=平移 · 滚轮=缩放 · 面 ' + scene.faces.length + ' · 边 ' + scene.edges.length))));
+      }
+
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minHeight: 0 } },
         h('div', { style: { display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' } },
           h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', marginRight: 2 } }, '视图'),
           VIEWS.map((v) => viewBtn(v, activeView === v)),
-          h('button', { style: { marginLeft: 'auto', padding: '1px 8px', fontSize: 11, cursor: 'pointer', borderRadius: 5, border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', background: 'transparent', color: 'var(--dsw-alias-label-primary, #111)' }, onClick: () => setView(fitView(0.7, 0.55)), title: '重置视图并适配' }, '重置')),
-        h('svg', {
-          viewBox: '0 0 ' + W + ' ' + H, width: '100%', height: '100%',
-          style: { background: 'var(--dsw-alias-bg-base, #fff)', borderRadius: 8, border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', touchAction: 'none', cursor: 'grab', flex: 1, minHeight: 0 },
-          onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp,
-          onWheel, onContextMenu: (e) => e.preventDefault(),
-        },
-          gridLines.map((g, i) => line(g, 'var(--dsw-alias-border-l1, #e5e7eb)', 0.5)),
-          axes.map((a, i) => line(a.pts, a.color, 1.2)),
-          h('g', null, faceEls),
-          h('g', null, edgeEls),
-          h('g', null, overlayEls)),
+          h('button', { style: { padding: '1px 8px', fontSize: 11, cursor: 'pointer', borderRadius: 5, border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', background: 'transparent', color: 'var(--dsw-alias-label-primary, #111)' }, onClick: () => setView(fitView(0.7, 0.55)), title: '重置视图并适配' }, '重置'),
+          maxBtn),
+        svgBlock({}),
         h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 } },
           h('span', { style: { flex: 1, color: selected ? 'var(--dsw-alias-brand-primary, #2563eb)' : 'var(--dsw-alias-label-tertiary, #9ca3af)', fontWeight: selected ? 600 : 400 } }, selText),
           h('span', { style: { color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } },
@@ -893,6 +1042,11 @@ window.__ModuleLoader__.load({
       const [assetTransform, setAssetTransform] = React.useState({ translate: [0, 0, 0], rotate: [0, 0, 0] });
       // 打赏二维码弹窗
       const [showReward, setShowReward] = React.useState(false);
+      // 打赏二维码双击放大（点击二维码图片放大显示）
+      const [rewardZoomed, setRewardZoomed] = React.useState(false);
+      // 版本更新检查（右下角：版本号 / 更新提醒 / 手动更新）
+      const [versionInfo, setVersionInfo] = React.useState(null); // { current, latest, updateAvailable }
+      const [updating, setUpdating] = React.useState(false); // 是否正在执行更新
       // 底部设置区（主体零件位移/旋转 + 夹具/毛坯）折叠/展开
       const [setupCollapsed, setSetupCollapsed] = React.useState(false);
       // FreeCAD 自动下载状态（未安装 FreeCAD 时展示进度并触发下载）
@@ -1090,6 +1244,66 @@ window.__ModuleLoader__.load({
 
       // 挂载时查询一次 FreeCAD 状态（未安装时展示下载入口）
       React.useEffect(() => { checkFcStatus(); }, [checkFcStatus]);
+
+      // 查询本插件版本与 npm 最新版本（用于右下角更新提醒）
+      const checkVersion = React.useCallback(() => {
+        fetch('/dsh-cam/version')
+          .then((r) => r.json())
+          .then((d) => { if (d && d.ok) setVersionInfo({ current: d.current, latest: d.latest, updateAvailable: !!d.updateAvailable }); })
+          .catch(() => {});
+      }, []);
+      React.useEffect(() => { checkVersion(); }, [checkVersion]);
+
+      // 点击「更新」：通过 dshmarket 的公共更新 API 触发更新（同源、带浏览器会话 cookie）
+      const doUpdate = React.useCallback(() => {
+        if (!versionInfo || updating) return;
+        setUpdating(true); setErr(null);
+        fetch('/dsh-market/api/v1/updates', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ packageName: 'dsh-qizhoucnc-cam' }),
+        })
+          .then(async (r) => {
+            const d = await r.json().catch(() => ({}));
+            if (!r.ok) {
+              const msg = (d && (d.error || d.failure?.message)) || ('更新请求失败（HTTP ' + r.status + '）');
+              setErr('更新失败：' + msg + '。可前往「设置 → 插件市场」手动更新。');
+              return;
+            }
+            // 202 = 已排队/进行中；200 = 已完成。随后刷新版本信息。
+            if (d.operation && d.operation.operationId) {
+              const opId = d.operation.operationId;
+              const poll = () => {
+                fetch('/dsh-market/api/v1/operations?operationId=' + encodeURIComponent(opId))
+                  .then((r2) => r2.json())
+                  .then((o) => {
+                    const op = o && o.operation;
+                    if (!op) return;
+                    if (op.state === 'succeeded') {
+                      setErr(null); setVersionInfo((prev) => prev ? { ...prev, updateAvailable: false } : prev);
+                      setTimeout(checkVersion, 1500);
+                      if (op.outcome && op.outcome.restartRequired) setErr('已更新到 ' + (op.installedVersion || '新版本') + '，重启 DSH 后生效。');
+                      else if (op.outcome && op.outcome.refreshRequired) { setErr('已更新到 ' + (op.installedVersion || '新版本') + '，已生效。'); }
+                      else setErr('已更新到 ' + (op.installedVersion || '新版本') + '。');
+                    } else if (op.state === 'failed') {
+                      setErr('更新失败：' + ((op.failure && op.failure.message) || '未知错误'));
+                    } else if (op.state === 'cancelled') {
+                      setErr('更新已取消。');
+                    } else {
+                      setTimeout(poll, 1200);
+                    }
+                  })
+                  .catch(() => setTimeout(poll, 1500));
+              };
+              poll();
+            } else {
+              setVersionInfo((prev) => prev ? { ...prev, updateAvailable: false } : prev);
+              setTimeout(checkVersion, 1500);
+            }
+          })
+          .catch((e) => setErr('更新失败：' + String(e)))
+          .finally(() => setUpdating(false));
+      }, [versionInfo, updating, checkVersion]);
 
       // 拉取该模型已写入的「识别文件」标注
       const loadFeatures = React.useCallback((modelPath) => {
@@ -1654,7 +1868,7 @@ window.__ModuleLoader__.load({
                       // 隐藏的原生文件选择框（选单个 STEP，读字节上传后回填路径）
                       h('input', { type: 'file', accept: '.step,.stp,.brep,.iges,.igs', ref: assetFileRef, style: { display: 'none' }, onChange: onAssetFileChosen }))))
               : h(Viewer3D, { data })),
-          // 打赏 footer（左下角）
+          // 打赏 footer（左下角打赏 + 右下角版本号/更新提醒）
           h('div', {
             style: {
               padding: '6px 12px 8px', borderTop: '1px solid var(--dsw-alias-border-l1, #eceff3)',
@@ -1679,7 +1893,24 @@ window.__ModuleLoader__.load({
                 background: 'linear-gradient(135deg, #fbbf24, #f59e0b)',
                 color: '#7c2d12', fontWeight: 700, padding: 0,
               },
-            }, '¥')),
+            }, '¥'),
+            // 右下角：版本号（无更新时）或 更新提醒 + 手动更新按钮
+            h('span', { style: { flex: 1 } }),
+            versionInfo && versionInfo.updateAvailable
+              ? h(React.Fragment, null,
+                  h('span', {
+                    title: '发现新版本 v' + (versionInfo.latest || '') + '（当前 v' + (versionInfo.current || '') + '）',
+                    style: { fontSize: 11, color: '#b45309', fontWeight: 600 },
+                  }, '新版本 v' + versionInfo.latest + ' 可用'),
+                  h('button', {
+                    onClick: doUpdate, disabled: updating,
+                    style: { ...btn, fontSize: 11, padding: '2px 10px', fontWeight: 600, borderColor: 'var(--dsw-alias-state-business-primary, #2563eb)', color: 'var(--dsw-alias-state-business-primary, #2563eb)' },
+                    title: '点击更新到 v' + versionInfo.latest,
+                  }, updating ? '更新中…' : '更新'))
+              : h('span', {
+                  style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' },
+                  title: '当前版本',
+                }, 'v' + (versionInfo ? versionInfo.current : '…'))),
           // 打赏二维码弹窗
           showReward
             ? h('div', {
@@ -1708,11 +1939,42 @@ window.__ModuleLoader__.load({
                     },
                   },
                     '莫愁前路无知己，天下谁人不识君。', h('br', null), '起舟扬帆难不畏，越是当下最好时。'),
-                  h('img', { src: '/dsh-cam/qrcode', alt: '微信收款二维码', style: { width: 112, height: 'auto', borderRadius: 8, display: 'block' } }),
+                  h('img', {
+                    src: '/dsh-cam/qrcode', alt: '微信收款二维码',
+                    title: '点击放大',
+                    onClick: () => setRewardZoomed(true),
+                    style: { width: 112, height: 'auto', borderRadius: 8, display: 'block', cursor: 'zoom-in' },
+                  }),
+                  h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } }, '👆 点击二维码可放大查看'),
                   h('div', { style: { fontSize: 15, fontWeight: 700, color: '#d97706', letterSpacing: '0.5px' } }, '微信扫码 · 支持鼓励一下'),
                   h('div', { style: { textAlign: 'center', fontSize: 13, lineHeight: '20px', color: '#4b5563', padding: '0 8px' } },
                     '如果觉得对你有帮助，打赏一下，让我知道帮助到了又一个同道中人。'),
                   h('button', { onClick: () => setShowReward(false), style: { ...btn, fontSize: 13, padding: '4px 16px' } }, '关闭')))
+            : null,
+          // 打赏二维码放大弹窗（点击二维码图片后放大显示）
+          showReward && rewardZoomed
+            ? h('div', {
+                style: {
+                  position: 'fixed', inset: 0, zIndex: 3200,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  background: 'rgba(15, 23, 42, 0.72)',
+                },
+                onClick: () => setRewardZoomed(false),
+              },
+                h('div', {
+                  style: {
+                    background: 'var(--dsw-alias-bg-base, #fff)', borderRadius: 16, padding: 20,
+                    boxShadow: '0 24px 80px rgba(0,0,0,0.45)', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12,
+                    maxWidth: 'min(420px, 92vw)',
+                  },
+                  onClick: (e) => e.stopPropagation(),
+                },
+                  h('img', {
+                    src: '/dsh-cam/qrcode', alt: '微信收款二维码（放大）',
+                    style: { width: 'min(360px, 78vw)', height: 'auto', borderRadius: 10, display: 'block' },
+                  }),
+                  h('div', { style: { fontSize: 13, color: '#4b5563' } }, '微信扫一扫 · 支持鼓励一下'),
+                  h('button', { onClick: () => setRewardZoomed(false), style: { ...btn, fontSize: 13, padding: '4px 16px' } }, '收起')))
             : null,
         )));
     }

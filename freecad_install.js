@@ -119,14 +119,22 @@ function extractAsset(dest, kind) {
 }
 
 // 下载 FreeCAD 资产（重试 + 国内镜像回退）。成功后返回最终下载路径。
-function downloadAsset(asset, dest, onChunk) {
+function downloadAsset(asset, dest) {
   // 从 GitHub 直连下载（国内可能被重置）。失败则回退国内加速镜像 ghproxy。
   const urls = [asset.url, 'https://mirror.ghproxy.com/' + asset.url, 'https://ghproxy.net/' + asset.url];
+  // 本地文件是否已完整下载（>= 远端体积）。这是 416 报错的关键判据：
+  // curl -C - 对「已下满」的文件续传时，服务器返回 HTTP 416（Range 不可满足），curl 以 22 退出。
+  const completeOnDisk = () => {
+    if (!(asset.size > 0)) return false;
+    try { return statSync(dest).size >= asset.size; } catch { return false; }
+  };
   return new Promise((resolve, reject) => {
     const tryUrl = (idx) => {
       if (idx >= urls.length) { reject(new Error('所有下载源均失败')); return; }
+      // 已完整（例如上次下到 100% 但进程中断后再次触发）：直接视为下载完成，不再发请求。
+      if (completeOnDisk()) { resolve(dest); return; }
       const url = urls[idx];
-      // 每个源内部先做「首次小范围续传探测」，避免部分节点刚连上就被重置。
+      // -C - 断点续传：本地有半截文件则从断点继续，本地为空则从头下载。
       const child = spawn('curl', ['-L', '--fail', '--retry', '3', '--retry-delay', '2', '--connect-timeout', '15', '--max-time', '0', '-C', '-', '-o', dest, '--progress-bar', url], {
         cwd: FREEACAD_DIR, stdio: ['ignore', 'ignore', 'pipe'],
       });
@@ -134,6 +142,8 @@ function downloadAsset(asset, dest, onChunk) {
       child.stderr.on('data', (d) => { errBuf += String(d); });
       child.on('exit', (code) => {
         if (code === 0) { resolve(dest); return; }
+        // 下载到 100% 后 curl 重试续传收到 416 以 22 退出：文件其实已完整，按成功处理继续解压。
+        if (completeOnDisk()) { resolve(dest); return; }
         // 记录失败并回退下一个源。**不要删除 dest**：保留半截文件供 curl -C - 断点续传。
         if (idx + 1 < urls.length) {
           tryUrl(idx + 1);
