@@ -332,11 +332,17 @@ window.__ModuleLoader__.load({
       // 主体模型的位移/旋转（与夹具/毛坯同款 transform）：{ translate:[x,y,z], rotate:[rx,ry,rz] }
       const xf = transform || null;
       const tpv = xf ? applyAssetTransform(pv, xf) : pv;
-      // 已标注特征：kind+refId → feature 记录（用于橙色高亮）
-      const featureKey = (f) => f.kind + ':' + f.refId;
+      // 已标注特征：kind+refId → feature 记录（用于橙色高亮）。
+      // 批量标注（refIds）的特征，其每一个成员面/边都要映射到该记录，这样
+      // 「一起标注」的 N 个面/边会被一起高亮。
       const featMap = React.useMemo(() => {
         const m = {};
-        for (const f of features || []) m[featureKey(f)] = f;
+        for (const f of features || []) {
+          m[f.kind + ':' + f.refId] = f;
+          if (Array.isArray(f.refIds)) {
+            for (const id of f.refIds) m[f.kind + ':' + id] = f;
+          }
+        }
         return m;
       }, [features]);
 
@@ -415,8 +421,16 @@ window.__ModuleLoader__.load({
       const LOCATE_FILL = 'rgba(34,197,94,0.85)'; // 点击标签定位：亮绿高亮
       const LOCATE_STROKE = '#16a34a';
 
-      // 点击左侧标注列表某条 → 定位到模型对应面/边并高亮
-      const locateKey = locate ? (locate.kind + ':' + locate.id) : null;
+      // 点击左侧标注列表某条 → 定位到模型对应面/边并高亮。
+      // locate.ids 存在时（批量标注）高亮全部成员。
+      const locateIdSet = React.useMemo(() => {
+        const s = {};
+        if (locate) {
+          s[locate.kind + ':' + locate.id] = true;
+          if (Array.isArray(locate.ids)) for (const id of locate.ids) s[locate.kind + ':' + id] = true;
+        }
+        return s;
+      }, [locate]);
 
       // 光照着色：按面法向做朗伯明暗（Lambert），让每个面有明暗层次，立体感强、
       // 与浅色/深色背景都能区分开，避免纯色与背景融合。
@@ -453,7 +467,7 @@ window.__ModuleLoader__.load({
         const isSel = selected && selected.kind === 'face' && selected.id === f.id;
         const isMultiSel = !!selSetMap['face:' + f.id];
         const isFeat = featMap['face:' + f.id];
-        const isLoc = locateKey === 'face:' + f.id;
+        const isLoc = !!locateIdSet['face:' + f.id];
         const shade = shadeOf(faceNormal(f));
         const r = Math.round(96 * shade), g = Math.round(116 * shade), b = Math.round(140 * shade);
         const baseFill = 'rgb(' + r + ',' + g + ',' + b + ')';
@@ -485,7 +499,7 @@ window.__ModuleLoader__.load({
         const isSel = selected && selected.kind === 'edge' && selected.id === e.id;
         const isMultiSel = !!selSetMap['edge:' + e.id];
         const isFeat = featMap['edge:' + e.id];
-        const isLoc = locateKey === 'edge:' + e.id;
+        const isLoc = !!locateIdSet['edge:' + e.id];
         let pts = '';
         e.points.forEach((p, j) => { const [sx, sy] = toScreen(p); pts += (j === 0 ? '' : ' ') + sx.toFixed(1) + ',' + sy.toFixed(1); });
         edgeEls.push(h('polyline', {
@@ -1149,6 +1163,19 @@ window.__ModuleLoader__.load({
         return () => clearInterval(t);
       }, [loadChangedNc]);
 
+      // ESC 关闭全屏/弹窗：模型视窗放大 → 二维码放大 → 打赏弹窗，按优先级逐层退出。
+      React.useEffect(() => {
+        if (typeof window === 'undefined') return;
+        const onKey = (e) => {
+          if (e.key !== 'Escape') return;
+          if (modelMaximized) { setModelMaximized(false); return; }
+          if (rewardZoomed) { setRewardZoomed(false); return; }
+          if (showReward) { setShowReward(false); return; }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, [modelMaximized, rewardZoomed, showReward]);
+
       const post = React.useCallback((path, body) => fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).then((r) => r.json()), []);
 
       const reveal = React.useCallback((filePath) => {
@@ -1201,6 +1228,7 @@ window.__ModuleLoader__.load({
               setModelSelected(null);
               setModelSelectedSet([]);
               setSimilarPrompt(null);
+              setLocateTarget(null);
               setAnnotating(false);
               setMainTransform(null);
               setMainTf({ translate: [0, 0, 0], rotate: [0, 0, 0] });
@@ -1828,7 +1856,7 @@ window.__ModuleLoader__.load({
                             key: f.id,
                             title: '单击定位到模型 · 双击重命名 · 点击 ✕ 删除',
                             style: { display: 'flex', alignItems: 'center', gap: 6, padding: '5px 7px', fontSize: 12, borderRadius: 6, background: 'rgba(255,154,61,0.14)', border: '1px solid rgba(249,115,22,0.35)', cursor: 'pointer' },
-                            onClick: () => setLocateTarget({ kind: f.kind, id: f.refId }),
+                            onClick: () => { setLocateTarget({ kind: f.kind, id: f.refId, ids: Array.isArray(f.refIds) && f.refIds.length > 1 ? f.refIds : null }); setSimilarPrompt(null); },
                             onDoubleClick: () => startEditFeature(f),
                           },
                             h('span', { style: { fontSize: 12, color: '#f97316' } }, f.kind === 'face' ? '▨' : '╱'),
@@ -1852,11 +1880,13 @@ window.__ModuleLoader__.load({
                       onSelect: (sel) => {
                         applySelection(sel, false);
                         detectSimilar(sel.kind, sel.id);
+                        setLocateTarget(null); // 直接点面/边时清除旧的标签定位高亮
                       },
                       onSelectMulti: (sel) => {
                         // Shift+点击：切换多选；不触发相同特征弹窗（多选本身就是手动选择）
                         applySelection(sel, true);
                         setSimilarPrompt(null);
+                        setLocateTarget(null);
                       },
                       onAnnotate: (sel) => {
                         setModelSelected(sel);
