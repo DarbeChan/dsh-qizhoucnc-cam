@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-  id: '@local/dsh-cam',
+  id: 'dsh-qizhoucnc-cam',
   factory(require) {
     const React = require('react');
     const h = React.createElement;

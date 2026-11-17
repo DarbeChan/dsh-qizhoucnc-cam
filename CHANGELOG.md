@@ -2,6 +2,14 @@
 
 本文件记录 DSH-QizhouCNC_CAM 的各版本变更。
 
+## [1.3.18] - 2026-11-17
+
+### 修复 (Fixed)
+
+- **Windows / npm 安装无法加载**：v1.3.13–1.3.17 发布的 `client.js` 里模块加载 ID 被误写成了本地开发名 `@local/dsh-cam`，而 npm 安装的包名是 `dsh-qizhoucnc-cam`。宿主按包名解析客户端模块时对不上号，导致 Windows 等通过 npm 安装的机器插件无法加载。已把模块加载 ID 改回 `dsh-qizhoucnc-cam`（与 v1.3.12 及之前一致），本地开发副本仍用 `@local/dsh-cam` 分别维护。
+
+---
+
 ## [1.3.17] - 2026-11-17
 
 ### 修复 (Fixed)
