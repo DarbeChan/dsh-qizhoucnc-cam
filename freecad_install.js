@@ -1,10 +1,16 @@
 // 自动下载 FreeCAD（便携版）到插件数据目录，并定位 freecadcmd 可执行文件。
-// 覆盖：Linux AppImage（解压 --appimage-extract）、Windows 7z（需本机 7z 解压）。
+// 覆盖：Linux AppImage（解压 --appimage-extract）、Windows 7z（自带 7zr.exe 解压，无需本机装 7-Zip）。
 // macOS 暂不支持自动下载（返回明确提示），当前机器默认路径 /Applications/FreeCAD.app 已可被 resolveFreecadBin 探测。
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync, readFileSync, chmodSync, readdirSync, statSync, renameSync, unlinkSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { join, basename, dirname } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+// 插件包内自带的 7zr.exe（7-Zip 精简版，仅支持 .7z，官方 LGPL，约 600KB）。
+// 这样 Windows 用户无需单独安装 7-Zip 即可解压 FreeCAD 官方的 .7z 便携包。
+const BUNDLED_7ZR = join(__dirname, '7zr.exe');
 
 export const FREEACAD_DIR = join(homedir(), '.dsh', 'storages', 'dsh-cam-freecad');
 const STATE_FILE = join(FREEACAD_DIR, 'install-state.json');
@@ -100,15 +106,12 @@ function extractAsset(dest, kind) {
     return bin;
   }
   if (kind === '7z') {
-    // Windows 7z 需本机 7z/7za/7zr；找不到则报错提示安装 7-Zip 或用官方安装包。
-    let sevenZip = null;
-    for (const cmd of ['7z', '7za', '7zr']) {
-      const probe = spawnSync(cmd, [], { timeout: 5000 });
-      if (probe.error === undefined || probe.error === null) { sevenZip = cmd; break; }
-    }
+    // Windows 7z 解压：优先用系统 7z/7za，找不到则用插件包内自带的 7zr.exe（免安装）。
+    const sevenZip = resolveSevenZip();
     if (!sevenZip) {
-      throw new Error('解压 FreeCAD 7z 需要本机安装 7-Zip（未找到 7z 命令）。请先安装 7-Zip，或改用官方 installer.exe 安装。');
+      throw new Error('解压 FreeCAD 7z 需要 7-Zip，但本机未找到 7z 命令，且插件内置的 7zr.exe 缺失。请手动安装 7-Zip，或改用官方 installer.exe 安装。');
     }
+    // 7zr.exe 只支持 .7z 格式（FreeCAD 官方 Windows 便携包正是 .7z），用 -y 自动确认覆盖。
     const res = spawnSync(sevenZip, ['x', '-y', '-o' + FREEACAD_DIR, dest], { encoding: 'utf8', timeout: 600_000, maxBuffer: 64 * 1024 * 1024 });
     if (res.status !== 0) throw new Error('7z 解压失败：' + (res.stderr || res.stdout || '').slice(-600));
     const bin = portableFreecadBin();
@@ -116,6 +119,19 @@ function extractAsset(dest, kind) {
     return bin;
   }
   throw new Error('不支持的资产类型：' + kind);
+}
+
+// 解析本机可用的 7z 可执行文件：系统 PATH 里的 7z/7za/7zr → 插件包内置 7zr.exe。
+function resolveSevenZip() {
+  for (const cmd of ['7z', '7za', '7zr']) {
+    try {
+      const probe = spawnSync(cmd, [], { timeout: 5000 });
+      if (probe.error === undefined || probe.error === null) return cmd;
+    } catch { /* 尝试下一个 */ }
+  }
+  // 插件包内置 7zr.exe（Windows 专用）；仅当文件存在时返回，避免在非 Windows 上误用。
+  if (process.platform === 'win32' && existsSync(BUNDLED_7ZR)) return BUNDLED_7ZR;
+  return null;
 }
 
 // 下载 FreeCAD 资产（重试 + 国内镜像回退）。成功后返回最终下载路径。

@@ -1,0 +1,24 @@
+Third-Party Notices
+===================
+
+This distribution bundles the following third-party software:
+
+7-Zip (7zr.exe)
+---------------
+
+- Component: `7zr.exe` (the reduced standalone command-line version of 7-Zip).
+- Purpose: Extract the FreeCAD official Windows portable archive (`*.7z`) so
+  users do not have to install 7-Zip manually.
+- Version: 23.01
+- Source: https://www.7-zip.org/a/7zr.exe
+- License: GNU LGPL (with unRAR restriction). 7-Zip is free software
+  distributed under the GNU LGPL; see https://www.7-zip.org/license.txt
+- The binary is bundled unmodified.
+
+FreeCAD
+-------
+
+FreeCAD itself is downloaded on demand from the official FreeCAD GitHub
+releases (https://github.com/FreeCAD/FreeCAD/releases) and is NOT bundled in
+this package. FreeCAD is licensed under the GNU LGPL2+; see
+https://wiki.freecad.org/Licence for details.
