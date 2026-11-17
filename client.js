@@ -346,6 +346,17 @@ window.__ModuleLoader__.load({
         return m;
       }, [features]);
 
+      // 点击左侧标注列表某条 → 定位到模型对应面/边并高亮。
+      // locate.ids 存在时（批量标注）高亮全部成员。
+      const locateIdSet = React.useMemo(() => {
+        const s = {};
+        if (locate) {
+          s[locate.kind + ':' + locate.id] = true;
+          if (Array.isArray(locate.ids)) for (const id of locate.ids) s[locate.kind + ':' + id] = true;
+        }
+        return s;
+      }, [locate]);
+
       const toScreen = React.useCallback((p) => {
         const q = xf ? applyAssetTransform(p, xf) : p;
         const [sx, sy] = project3d([q[0] - tpv[0], q[1] - tpv[1], q[2] - tpv[2]], view.yaw, view.pitch);
@@ -420,17 +431,6 @@ window.__ModuleLoader__.load({
       const FEAT_FILL = 'rgba(255,154,61,0.72)'; // 已标注特征：橙色高亮
       const LOCATE_FILL = 'rgba(34,197,94,0.85)'; // 点击标签定位：亮绿高亮
       const LOCATE_STROKE = '#16a34a';
-
-      // 点击左侧标注列表某条 → 定位到模型对应面/边并高亮。
-      // locate.ids 存在时（批量标注）高亮全部成员。
-      const locateIdSet = React.useMemo(() => {
-        const s = {};
-        if (locate) {
-          s[locate.kind + ':' + locate.id] = true;
-          if (Array.isArray(locate.ids)) for (const id of locate.ids) s[locate.kind + ':' + id] = true;
-        }
-        return s;
-      }, [locate]);
 
       // 光照着色：按面法向做朗伯明暗（Lambert），让每个面有明暗层次，立体感强、
       // 与浅色/深色背景都能区分开，避免纯色与背景融合。

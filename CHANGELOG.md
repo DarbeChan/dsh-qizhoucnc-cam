@@ -2,6 +2,14 @@
 
 本文件记录 DSH-QizhouCNC_CAM 的各版本变更。
 
+## [1.3.17] - 2026-11-17
+
+### 修复 (Fixed)
+
+- **模型视窗崩溃（面板空白/闪退）**：修复 v1.3.16 引入的 React Hook 顺序错误——`ModelViewer3D` 里 `locateIdSet` 的 `useMemo` 被放在了「加载中…」早退 `return` 之后，导致模型加载后 Hook 数量不一致，触发 `Rendered fewer hooks than expected`，整个右侧面板崩溃。已把该 `useMemo` 上移到所有早退分支之前，Hook 顺序固定，不再崩溃。
+
+---
+
 ## [1.3.16] - 2026-11-17
 
 ### 新增 (Added)
