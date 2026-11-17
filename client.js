@@ -756,6 +756,13 @@ window.__ModuleLoader__.load({
       color: 'var(--dsw-alias-label-primary, #1a1a1a)', whiteSpace: 'pre', overflow: 'auto',
       WebkitTextSizeAdjust: '100%',
     };
+    const edFindInput = {
+      flex: 1, minWidth: 0, padding: '4px 10px', fontSize: 12, lineHeight: '20px',
+      fontFamily: 'var(--dsw-alias-font-code, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace)',
+      border: '1px solid var(--dsw-alias-border-l1, #d1d5db)', outline: 'none',
+      background: '#fff', color: 'var(--dsw-alias-label-primary, #1a1a1a)',
+      borderRadius: 6, height: 28, boxSizing: 'border-box',
+    };
 
     // React error boundary: catches any render crash inside the editor and shows the
     // message inline instead of letting the whole slot go blank.
@@ -773,15 +780,31 @@ window.__ModuleLoader__.load({
     }
 
     function NcEditor({ file, sessionId, version, onClose, onViewToolpath }) {
-      const [text, setText] = React.useState('');
+      // 文本存于 ref（不受控 textarea）：大 NC 文件下受控 textarea 每次交互都会让 React
+      // 重新序列化整段字符串，Ctrl+A 全选会导致卡死/无响应甚至拖垮宿主。改用 defaultValue +
+      // 直接读 DOM，只在「行数/查找」等轻量派生值变化时才 setState。
       const [loaded, setLoaded] = React.useState(false);
       const [err, setErr] = React.useState(null);
       const [busy, setBusy] = React.useState(false);
       const [savedAt, setSavedAt] = React.useState(null);
       const [menu, setMenu] = React.useState(null); // { x, y, sel, startLine, endLine }
+      const [lineCount, setLineCount] = React.useState(0);
+      const [initialText, setInitialText] = React.useState('');
       const taRef = React.useRef(null);
+      const textRef = React.useRef(''); // 当前文本的镜像，避免频繁 split 全串
+      // 查找：Ctrl+F / Cmd+F
+      const [findOpen, setFindOpen] = React.useState(false);
+      const [findQuery, setFindQuery] = React.useState('');
+      const [findCount, setFindCount] = React.useState(0);
+      const findRef = React.useRef(null);
 
       const post = React.useCallback((path, body) => fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).then((r) => r.json()), []);
+
+      // 读取 textarea 当前文本（不触发 React 渲染）
+      const currentText = React.useCallback(() => {
+        if (taRef.current) return taRef.current.value;
+        return textRef.current;
+      }, []);
 
       // 选中代码 → 引用进 DSH 对话框，方便模型快速定位
       // 服务在点击时惰性解析：apply 阶段 conversation 服务可能尚未就绪（立即加载时序）。
@@ -829,12 +852,12 @@ window.__ModuleLoader__.load({
         if (!ta) return;
         const start = ta.selectionStart, end = ta.selectionEnd;
         if (start === end) { setErr('请先选中要引用的代码'); setMenu(null); return; }
-        const sel = text.slice(start, end);
+        const sel = ta.value.slice(start, end);
         if (!sel.trim()) { setErr('选中的内容为空'); setMenu(null); return; }
         setMenu({
           x: e.clientX, y: e.clientY, sel,
-          startLine: text.slice(0, start).split('\n').length,
-          endLine: text.slice(0, end).split('\n').length,
+          startLine: ta.value.slice(0, start).split('\n').length,
+          endLine: ta.value.slice(0, end).split('\n').length,
         });
       };
 
@@ -842,15 +865,22 @@ window.__ModuleLoader__.load({
         if (!file) return;
         setErr(null); setLoaded(false); setSavedAt(null);
         fetch('/dsh-cam/nc?file=' + encodeURIComponent(file)).then((r) => r.json()).then((d) => {
-          if (d.ok) { setText(d.content ?? ''); setLoaded(true); }
-          else setErr(d.error || '读取失败');
+          if (d.ok) {
+            const content = d.content ?? '';
+            setInitialText(content);
+            textRef.current = content;
+            setLineCount(content ? content.split('\n').length : 0);
+            setLoaded(true);
+          } else setErr(d.error || '读取失败');
         }).catch((e) => setErr(String(e)));
       }, [file, version]);
 
       const save = () => {
         if (!file || !loaded) return;
+        const content = currentText();
+        textRef.current = content;
         setBusy(true); setErr(null);
-        post('/dsh-cam/save', { file, content: text })
+        post('/dsh-cam/save', { file, content })
           .then((d) => {
             if (d.ok) { setSavedAt(new Date().toLocaleTimeString()); setErr(null); }
             else setErr(d.error || '保存失败');
@@ -861,18 +891,71 @@ window.__ModuleLoader__.load({
 
       // 直接跳转到该 NC 文件对应的刀路视图（等价于「返回」+ 单击该文件名，不保存、不进入保存中状态）
       const viewToolpath = () => {
-        // 兜底清除可能卡住的 busy 状态（此前版本曾因保存卡住导致按钮禁用）
         setBusy(false); setErr(null);
         if (typeof onViewToolpath === 'function') onViewToolpath();
         else if (typeof onClose === 'function') onClose();
       };
 
+      // ---- 查找（Ctrl+F / Cmd+F） ----
+      const openFind = React.useCallback(() => {
+        setFindOpen(true);
+        setFindQuery('');
+        setFindCount(0);
+        setTimeout(() => { if (findRef.current) findRef.current.focus(); }, 0);
+      }, []);
+      const closeFind = React.useCallback(() => { setFindOpen(false); setFindQuery(''); setFindCount(0); }, []);
+      const doFind = React.useCallback((dir) => {
+        const ta = taRef.current;
+        if (!ta || !findQuery) return;
+        const q = findQuery;
+        const text = ta.value;
+        const cur = dir < 0 ? ta.selectionStart : ta.selectionEnd;
+        let idx;
+        if (dir < 0) {
+          idx = text.lastIndexOf(q, Math.max(0, cur - 1));
+          if (idx < 0) idx = text.lastIndexOf(q);
+        } else {
+          idx = text.indexOf(q, cur);
+          if (idx < 0) idx = text.indexOf(q);
+        }
+        if (idx >= 0) {
+          ta.focus();
+          ta.setSelectionRange(idx, idx + q.length);
+          ta.scrollTop = text.slice(0, idx).split('\n').length * 20 - ta.clientHeight / 2;
+        }
+        // 统计匹配次数
+        let n = 0, pos = 0;
+        while ((pos = text.indexOf(q, pos)) !== -1) { n++; pos += q.length; }
+        setFindCount(n);
+      }, [findQuery]);
+
       const onKey = (e) => {
-        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') { e.preventDefault(); save(); }
-        if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); onClose(); }
+        const mod = e.metaKey || e.ctrlKey;
+        const k = e.key.toLowerCase();
+        // Ctrl/Cmd+S 保存
+        if (mod && k === 's') { e.preventDefault(); e.stopPropagation(); save(); return; }
+        // Ctrl/Cmd+F 查找
+        if (mod && k === 'f') { e.preventDefault(); e.stopPropagation(); openFind(); return; }
+        // Ctrl/Cmd+A 全选：阻止冒泡，避免宿主全局「全选」处理器干扰导致卡死
+        if (mod && k === 'a') { e.preventDefault(); e.stopPropagation(); const ta = taRef.current; if (ta) { ta.focus(); ta.select(); } return; }
+        if (e.key === 'Escape') {
+          if (findOpen) { e.preventDefault(); e.stopPropagation(); closeFind(); return; }
+          e.preventDefault(); e.stopPropagation(); onClose();
+        }
+      };
+      const onFindKey = (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); doFind(e.shiftKey ? -1 : 1); }
+        if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeFind(); }
       };
 
-      const lineCount = text ? text.split('\n').length : 0;
+      const onChange = (e) => {
+        const v = e.target.value;
+        textRef.current = v;
+        // 仅在行数变化时更新状态；用 indexOf 计数换行，避免大文件 split 出巨量数组。
+        let n = 1, p = 0;
+        while ((p = v.indexOf('\n', p)) !== -1) { n++; p++; }
+        setLineCount((prev) => (prev === n ? prev : n));
+      };
 
       return h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', display: 'flex', flexDirection: 'column', background: 'var(--dsw-alias-bg-base, #fff)' } },
         h('div', { style: ED_HEAD },
@@ -880,14 +963,28 @@ window.__ModuleLoader__.load({
             '编辑 NC：' + (file || '')),
           savedAt ? h('span', { style: { fontSize: 12, fontWeight: 600, color: '#ffffff', background: '#16a34a', padding: '2px 10px', borderRadius: 10, flex: 'none', lineHeight: '18px' } }, '✓ 已保存 ' + savedAt) : null,
           h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', flex: 'none' } }, lineCount + ' 行'),
-          h('button', { style: edBtnPrimary, onClick: save, disabled: busy || !loaded, title: '保存并刷新刀路 (⌘S)' }, busy ? '保存中…' : '保存'),
+          h('button', { style: edBtnPrimary, onClick: save, disabled: busy || !loaded, title: '保存并刷新刀路 (Ctrl/Cmd+S)' }, busy ? '保存中…' : '保存'),
+          h('button', { style: edBtnGhost, onClick: openFind, title: '查找 (Ctrl/Cmd+F)' }, '查找'),
           h('button', { style: edBtnGhost, onClick: viewToolpath, title: '查看该 NC 文件对应的刀路' }, '查看刀路'),
           h('button', { style: edBtnDanger, onClick: onClose, title: '返回刀路视图' }, '返回')),
         err ? h('div', { style: { padding: '8px 14px', color: 'var(--dsw-alias-state-error-primary, #dc2626)', fontSize: 12, borderBottom: '1px solid var(--dsw-alias-border-l1, #eceff3)' } }, '错误：' + err) : null,
+        findOpen ? h('div', {
+          style: { display: 'flex', alignItems: 'center', gap: 6, padding: '6px 14px', borderBottom: '1px solid var(--dsw-alias-border-l1, #eceff3)', background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)' },
+        },
+          h('input', {
+            ref: findRef, style: edFindInput,
+            value: findQuery, placeholder: '查找…（Enter 下一个 · Shift+Enter 上一个）',
+            onChange: (e) => setFindQuery(e.target.value), onKeyDown: onFindKey,
+          }),
+          findCount > 0 ? h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #6b7280)', flex: 'none' } }, findCount + ' 处') : null,
+          h('button', { style: { ...edBtnGhost, fontSize: 11, padding: '2px 8px' }, onClick: () => doFind(-1), title: '上一个 (Shift+Enter)' }, '↑'),
+          h('button', { style: { ...edBtnGhost, fontSize: 11, padding: '2px 8px' }, onClick: () => doFind(1), title: '下一个 (Enter)' }, '↓'),
+          h('button', { style: { ...edBtnGhost, fontSize: 11, padding: '2px 8px' }, onClick: closeFind, title: '关闭查找 (Esc)' }, '✕'))
+        : null,
         h('textarea', {
-          ref: taRef, style: edTextarea, value: text, spellCheck: false, autoCapitalize: 'off', autoCorrect: 'off',
+          ref: taRef, key: version, style: edTextarea, defaultValue: initialText, spellCheck: false, autoCapitalize: 'off', autoCorrect: 'off',
           placeholder: loaded ? '' : '加载中…',
-          onChange: (e) => setText(e.target.value), onKeyDown: onKey, onContextMenu: onContextMenu,
+          onChange: onChange, onKeyDown: onKey, onContextMenu: onContextMenu,
         }),
         menu ? h('div', {
           style: {

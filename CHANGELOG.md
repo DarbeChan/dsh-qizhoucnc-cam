@@ -2,6 +2,18 @@
 
 本文件记录 DSH-QizhouCNC_CAM 的各版本变更。
 
+## [1.3.22] - 2026-11-18
+
+### 修复 (Fixed)
+
+- **NC 编辑器 Ctrl+A 卡死/无响应**：编辑器里的 `<textarea>` 是受控组件（`value` 绑定 React state），大 NC 文件下每次交互都会让 React 重新序列化整段字符串，Ctrl+A 全选更是叠加宿主全局「全选」处理器，导致插件乃至 DSH 无响应。现改为**非受控 textarea**（`defaultValue` + 直接读 DOM），文本存于 ref，只在行数变化时才 setState；并对 Ctrl+A/Ctrl+S/Ctrl+F/Esc 做 `preventDefault + stopPropagation`，避免与宿主快捷键冲突。
+
+### 新增 (Added)
+
+- **NC 编辑器查找（Ctrl+F / Cmd+F）**：编辑 NC 时按 `Ctrl+F`（Mac `Cmd+F`）或点工具栏「查找」按钮，弹出查找栏；输入关键字后 `Enter` 下一个、`Shift+Enter` 上一个，实时显示匹配次数，命中后自动滚动定位并选中。
+
+---
+
 ## [1.3.21] - 2026-11-17
 
 ### 修复 (Fixed)
