@@ -8,9 +8,10 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-// 插件包内自带的 7zr.exe（7-Zip 精简版，仅支持 .7z，官方 LGPL，约 600KB）。
-// 这样 Windows 用户无需单独安装 7-Zip 即可解压 FreeCAD 官方的 .7z 便携包。
-const BUNDLED_7ZR = join(__dirname, '7zr.exe');
+// 插件包内自带的 7-Zip 独立控制台版（7za.exe，无需外部 DLL，支持 LZMA/LZMA2 等 7z 编解码）。
+// 之前用 7zr.exe（精简版只支持 LZMA）解压 FreeCAD 官方的 .7z（实为 LZMA2）会失败，故改用 7za.exe。
+const BUNDLED_7ZA = join(__dirname, '7za.exe');
+const BUNDLED_7ZA_ARM64 = join(__dirname, '7za-arm64.exe');
 
 export const FREEACAD_DIR = join(homedir(), '.dsh', 'storages', 'dsh-cam-freecad');
 const STATE_FILE = join(FREEACAD_DIR, 'install-state.json');
@@ -106,12 +107,12 @@ function extractAsset(dest, kind) {
     return bin;
   }
   if (kind === '7z') {
-    // Windows 7z 解压：优先用系统 7z/7za，找不到则用插件包内自带的 7zr.exe（免安装）。
+    // Windows 7z 解压：优先用系统 7z/7za，找不到则用插件包内自带的 7za.exe（免安装、支持 LZMA2）。
     const sevenZip = resolveSevenZip();
     if (!sevenZip) {
-      throw new Error('解压 FreeCAD 7z 需要 7-Zip，但本机未找到 7z 命令，且插件内置的 7zr.exe 缺失。请手动安装 7-Zip，或改用官方 installer.exe 安装。');
+      throw new Error('解压 FreeCAD 7z 需要 7-Zip，但本机未找到 7z 命令，且插件内置的 7za.exe 缺失。请手动安装 7-Zip，或改用官方 installer.exe 安装。');
     }
-    // 7zr.exe 只支持 .7z 格式（FreeCAD 官方 Windows 便携包正是 .7z），用 -y 自动确认覆盖。
+    // 7za.exe 支持 7z 全编解码（含 FreeCAD 官方 .7z 使用的 LZMA2），用 -y 自动确认覆盖。
     const res = spawnSync(sevenZip, ['x', '-y', '-o' + FREEACAD_DIR, dest], { encoding: 'utf8', timeout: 600_000, maxBuffer: 64 * 1024 * 1024 });
     if (res.status !== 0) throw new Error('7z 解压失败：' + (res.stderr || res.stdout || '').slice(-600));
     const bin = portableFreecadBin();
@@ -121,7 +122,7 @@ function extractAsset(dest, kind) {
   throw new Error('不支持的资产类型：' + kind);
 }
 
-// 解析本机可用的 7z 可执行文件：系统 PATH 里的 7z/7za/7zr → 插件包内置 7zr.exe。
+// 解析本机可用的 7z 可执行文件：系统 PATH 里的 7z/7za/7zr → 插件包内置 7za.exe（按架构）。
 function resolveSevenZip() {
   for (const cmd of ['7z', '7za', '7zr']) {
     try {
@@ -129,8 +130,11 @@ function resolveSevenZip() {
       if (probe.error === undefined || probe.error === null) return cmd;
     } catch { /* 尝试下一个 */ }
   }
-  // 插件包内置 7zr.exe（Windows 专用）；仅当文件存在时返回，避免在非 Windows 上误用。
-  if (process.platform === 'win32' && existsSync(BUNDLED_7ZR)) return BUNDLED_7ZR;
+  // 插件包内置 7za.exe（Windows 专用，按架构选择）；仅当文件存在时返回。
+  if (process.platform === 'win32') {
+    if (process.arch === 'arm64' && existsSync(BUNDLED_7ZA_ARM64)) return BUNDLED_7ZA_ARM64;
+    if (existsSync(BUNDLED_7ZA)) return BUNDLED_7ZA;
+  }
   return null;
 }
 

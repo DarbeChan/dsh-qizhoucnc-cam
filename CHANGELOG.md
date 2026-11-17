@@ -2,6 +2,15 @@
 
 本文件记录 DSH-QizhouCNC_CAM 的各版本变更。
 
+## [1.3.20] - 2026-11-17
+
+### 修复 (Fixed)
+
+- **Windows 解压 FreeCAD 仍失败**：上一版内置的 `7zr.exe` 是 7-Zip 精简版，只支持 LZMA 编解码，而 FreeCAD 官方 `.7z` 便携包用的是 LZMA2，导致解压失败。本版改为内置 7-Zip 独立控制台版 `7za.exe`（x64 + arm64 两份，无需外部 DLL，支持 7z 全编解码含 LZMA2），解压逻辑优先系统 7z/7za，找不到就调用内置 `7za.exe`。随包附带 `7za-LICENSE.txt` 与更新后的 `NOTICE`。
+- **模型加载「Unexpected end of JSON input」**：宿主路由异常或 FreeCAD 崩溃时可能返回空响应/非 JSON，客户端直接 `r.json()` 会抛 `SyntaxError: Failed to execute 'json' on 'Response': Unexpected end of JSON input`。已把所有客户端 fetch 统一走安全 JSON 读取，遇到空体/非 JSON 会兜底成友好错误提示，不再白屏报错。
+
+---
+
 ## [1.3.19] - 2026-11-17
 
 ### 修复 (Fixed)

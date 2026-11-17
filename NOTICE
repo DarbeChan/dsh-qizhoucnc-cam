@@ -3,17 +3,20 @@ Third-Party Notices
 
 This distribution bundles the following third-party software:
 
-7-Zip (7zr.exe)
----------------
+7-Zip (7za.exe / 7za-arm64.exe)
+-------------------------------
 
-- Component: `7zr.exe` (the reduced standalone command-line version of 7-Zip).
-- Purpose: Extract the FreeCAD official Windows portable archive (`*.7z`) so
-  users do not have to install 7-Zip manually.
-- Version: 23.01
-- Source: https://www.7-zip.org/a/7zr.exe
-- License: GNU LGPL (with unRAR restriction). 7-Zip is free software
-  distributed under the GNU LGPL; see https://www.7-zip.org/license.txt
-- The binary is bundled unmodified.
+- Component: `7za.exe` (x64) and `7za-arm64.exe` (arm64) — the standalone
+  console version of 7-Zip, no external DLL required.
+- Purpose: Extract the FreeCAD official Windows portable archive (`*.7z`,
+  compressed with LZMA2) so users do not have to install 7-Zip manually.
+  The reduced `7zr.exe` is NOT bundled because it only supports the LZMA
+  codec and cannot extract FreeCAD's LZMA2 archive.
+- Version: 26.06 (7-Zip "Extra" package)
+- Source: https://github.com/ip7z/7zip/releases/tag/26.06 (7z2606-extra.7z)
+- License: GNU LGPL (main license), with BSD 3-clause and BSD 2-clause
+  portions. See the full text in `7za-LICENSE.txt` included in this package.
+- The binaries are bundled unmodified.
 
 FreeCAD
 -------
