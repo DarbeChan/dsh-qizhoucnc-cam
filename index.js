@@ -289,7 +289,10 @@ function readNcText(filePath) {
   return readFileSync(p, 'utf8');
 }
 
-// ---- validate that a path is a permitted NC file inside a known workspace ----
+// ---- validate that a path is a permitted NC file ----
+// 不再要求文件必须位于 DSH workspace 内：用户可能把 NC 文件放在 U 盘、移动硬盘、
+// 网络盘等任意位置（例如 G:\...）。只要文件真实存在、扩展名是 .nc/.cnc/.gcode 即可。
+// 文件列表 UI 只展示用户显式扫描/选择到的文件，本身已是用户授权边界。
 const NC_EXT = /\.(nc|cnc|gcode)$/i;
 function assertNcPath(filePath) {
   const p = resolvePath(filePath);
@@ -297,12 +300,6 @@ function assertNcPath(filePath) {
   if (!existsSync(p)) throw new Error('NC file not found: ' + p);
   // 2) extension must be a known NC/G-code suffix
   if (!NC_EXT.test(p)) throw new Error('Unsupported file type (allowed: .nc / .cnc / .gcode): ' + p);
-  // 3) must reside inside a known DSH workspace (or the process cwd)
-  const rel = (a, b) => { const r = relative(a, b); return r === '' || (!r.startsWith('..') && !isAbsolute(r)); };
-  const dir = dirname(p);
-  const { all } = getWorkspaceInfo();
-  const within = all.some((ws) => rel(ws, dir));
-  if (!within) throw new Error('File is outside the workspace: ' + p);
   return p;
 }
 
