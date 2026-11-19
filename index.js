@@ -1,7 +1,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import z from '@deepseek-ai/schemastery';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync, rmdirSync, copyFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync, rmdirSync, copyFileSync, appendFileSync, renameSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname, basename, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +24,58 @@ const RENDER_SCRIPT = join(__dirname, 'toolpath_render.py');
 const MODEL_SCRIPT = join(__dirname, 'model_tessellate.py');
 const STATE_FILE = join(homedir(), '.dsh', 'storages', 'dsh-cam-toolpath.json');
 const WORKSPACE_STORE = join(homedir(), '.dsh', 'storages', 'workspace.json');
+
+// ---- 诊断日志（持久化到磁盘，便于"导出日志"定位问题） ----
+// 每次调用写一行 JSON，滚动保留最近约 1MB（超过则备份为 .1 再重开）。写入失败静默忽略，绝不影响主流程。
+const LOG_FILE = join(homedir(), '.dsh', 'storages', 'dsh-cam.log');
+const LOG_MAX_BYTES = 1024 * 1024;
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+// 写入一条结构化日志。detail 尽量是可 JSON 化的对象；字符串会原样记录。
+function log(level, event, detail) {
+  try {
+    mkdirSync(dirname(LOG_FILE), { recursive: true });
+    let size = 0;
+    try { size = statSync(LOG_FILE).size; } catch { /* 不存在 */ }
+    if (size > LOG_MAX_BYTES) {
+      try {
+        const bak = LOG_FILE + '.1';
+        unlinkSync(bak); // 只保留一代备份
+        renameSync(LOG_FILE, bak);
+      } catch { /* ignore */ }
+    }
+    const rec = {
+      t: nowIso(),
+      level,
+      event,
+      platform: process.platform,
+      arch: process.arch,
+      pid: process.pid,
+    };
+    if (detail instanceof Error) {
+      rec.message = detail.message;
+      rec.stack = detail.stack;
+    } else if (typeof detail === 'object' && detail !== null) {
+      rec.detail = detail;
+    } else if (detail !== undefined && detail !== null) {
+      rec.message = String(detail);
+    }
+    appendFileSync(LOG_FILE, JSON.stringify(rec) + '\n', 'utf8');
+  } catch { /* 日志本身失败不能影响功能 */ }
+}
+
+// 读取最近的日志（最多 maxLines 行，倒序取尾部）；返回字符串，供"导出日志"接口使用。
+function readLogTail(maxLines = 2000) {
+  try {
+    if (!existsSync(LOG_FILE)) return '';
+    const raw = readFileSync(LOG_FILE, 'utf8');
+    const lines = raw.split('\n').filter(Boolean);
+    return lines.slice(-maxLines).join('\n');
+  } catch { return ''; }
+}
 
 // Latest parsed toolpath, exposed to the floating viewer over a same-origin route.
 let latestToolpath = null;
@@ -405,7 +457,11 @@ function stageAsciiRun(modelPath, scriptPath, scriptName) {
 
 function tessellateModel(modelPath, opts = {}) {
   const freecadBin = resolveFreecadBin(opts.freecadBin);
-  if (!freecadBin) throw new Error(freecadMissingError(opts.freecadBin));
+  if (!freecadBin) {
+    const e = new Error(freecadMissingError(opts.freecadBin));
+    log('error', 'tessellate:no-freecad', e);
+    throw e;
+  }
   const p = assertModelPath(modelPath);
   // Run FreeCAD from a pure-ASCII temp dir so non-ASCII script/model paths can't
   // crash freecadcmd. Always stage (cheap, ~1 file copy) to keep one code path.
@@ -417,25 +473,42 @@ function tessellateModel(modelPath, opts = {}) {
     CAM_MODEL: stagedModel, CAM_MODEL_OUT: outFile,
     CAM_TESS_TOL: String(opts.tol ?? 0.1),
   };
+  log('info', 'tessellate:start', { model: p, stagedModel, freecadBin, tol: opts.tol ?? 0.1 });
   let scene;
   try {
     const res = spawnSync(freecadBin, [stagedScript], { env, encoding: 'utf8', timeout: 180_000, maxBuffer: 256 * 1024 * 1024 });
+    log('info', 'tessellate:spawn-done', {
+      model: p,
+      status: res.status,
+      signal: res.signal,
+      stdoutTail: (res.stdout || '').trim().split('\n').slice(-20).join('\n'),
+      stderrTail: (res.stderr || '').trim().split('\n').slice(-20).join('\n'),
+    });
     if (res.error) throw res.error;
     if (!existsSync(outFile)) {
       const tail = (res.stderr || res.stdout || '').trim().split('\n').slice(-12).join('\n');
-      throw new Error('FreeCAD tessellation failed to produce model JSON.\n' + tail);
+      const e = new Error('FreeCAD tessellation failed to produce model JSON.\n' + tail);
+      log('error', 'tessellate:no-json', { model: p, status: res.status, signal: res.signal, stderr: (res.stderr || '').slice(-4000), stdout: (res.stdout || '').slice(-4000) });
+      throw e;
     }
     try {
       scene = JSON.parse(readFileSync(outFile, 'utf8'));
-    } catch (e) {
-      throw new Error('Invalid tessellation JSON: ' + (e && e.message ? e.message : e));
+    } catch (err) {
+      const e = new Error('Invalid tessellation JSON: ' + (err && err.message ? err.message : err));
+      log('error', 'tessellate:bad-json', e);
+      throw e;
     }
   } finally {
     cleanup();
   }
-  if (!scene || scene.ok !== true) throw new Error('Tessellation failed: ' + (scene && scene.error ? scene.error : 'unknown'));
+  if (!scene || scene.ok !== true) {
+    const e = new Error('Tessellation failed: ' + (scene && scene.error ? scene.error : 'unknown'));
+    log('error', 'tessellate:scene-not-ok', e);
+    throw e;
+  }
   // restore the original model path so the client still labels the model correctly
   if (typeof scene.file === 'string') scene.file = p;
+  log('info', 'tessellate:done', { model: p, faces: scene.faceCount, edges: scene.edgeCount });
   return scene;
 }
 
@@ -587,9 +660,17 @@ function assetSceneOf(asset) {
 // ---- generate a G-code toolpath from a STEP/BREP/IGES model via FreeCAD CAM ----
 function generateToolpathFromModel(modelPath, opts = {}) {
   const freecadBin = resolveFreecadBin(opts.freecadBin);
-  if (!freecadBin) throw new Error(freecadMissingError(opts.freecadBin));
+  if (!freecadBin) {
+    const e = new Error(freecadMissingError(opts.freecadBin));
+    log('error', 'cam:no-freecad', e);
+    throw e;
+  }
   const p = resolvePath(modelPath);
-  if (!existsSync(p)) throw new Error('Model file not found: ' + p);
+  if (!existsSync(p)) {
+    const e = new Error('Model file not found: ' + p);
+    log('error', 'cam:model-missing', e);
+    throw e;
+  }
   // write the NC file next to the model, with the same base name (panda.step -> panda.nc)
   const base = basename(p).replace(/\.[^.]+$/, '');
   const outFile = join(dirname(p), base + '.nc');
@@ -602,13 +683,23 @@ function generateToolpathFromModel(modelPath, opts = {}) {
     CAM_MODEL: stagedModel, CAM_OUT: stagedOut,
     CAM_STEPDOWN: String(opts.stepDown ?? 2), CAM_FINALDEPTH: String(opts.finalDepth ?? 6), CAM_POST: String(opts.post ?? 'grbl'),
   };
+  log('info', 'cam:start', { model: p, outFile, freecadBin, stepDown: opts.stepDown, finalDepth: opts.finalDepth, post: opts.post });
   let gcode;
   try {
     const res = spawnSync(freecadBin, [stagedScript], { env, encoding: 'utf8', timeout: 270_000, maxBuffer: 128 * 1024 * 1024 });
+    log('info', 'cam:spawn-done', {
+      model: p,
+      status: res.status,
+      signal: res.signal,
+      stdoutTail: (res.stdout || '').trim().split('\n').slice(-20).join('\n'),
+      stderrTail: (res.stderr || '').trim().split('\n').slice(-20).join('\n'),
+    });
     if (res.error) throw res.error;
     if (!existsSync(stagedOut)) {
       const tail = (res.stderr || res.stdout || '').trim().split('\n').slice(-12).join('\n');
-      throw new Error('FreeCAD CAM failed to produce G-code.\n' + tail);
+      const e = new Error('FreeCAD CAM failed to produce G-code.\n' + tail);
+      log('error', 'cam:no-gcode', { model: p, status: res.status, signal: res.signal, stderr: (res.stderr || '').slice(-4000), stdout: (res.stdout || '').slice(-4000) });
+      throw e;
     }
     gcode = readFileSync(stagedOut, 'utf8');
     writeFileSync(outFile, gcode, 'utf8');
@@ -619,6 +710,7 @@ function generateToolpathFromModel(modelPath, opts = {}) {
   tp.file = outFile;
   latestToolpath = tp;
   saveState(tp);
+  log('info', 'cam:done', { model: p, outFile, lines: gcode.split('\n').length, segments: tp.paths.length });
   return { tp, gcode };
 }
 
@@ -633,6 +725,13 @@ export const Config = z.object({
 export function apply(ctx, config = {}) {
   // 原始配置值；真正解析（含探测与友好报错）在 tessellateModel / generateToolpathFromModel 内按需进行。
   const freecadBin = config.freecadBin;
+
+  log('info', 'plugin:start', {
+    version: readOwnVersion(),
+    freecadConfigured: typeof freecadBin === 'string' && freecadBin.trim() ? freecadBin.trim() : null,
+    tmpdir: tmpdir(),
+    dshHome: join(homedir(), '.dsh'),
+  });
 
   // restore persisted toolpath so the viewer is not empty after a restart
   latestToolpath = loadState();
@@ -966,6 +1065,37 @@ export function apply(ctx, config = {}) {
             return;
           }
           send(res, { ok: true, found: !!resolveFreecadBin(freecadBin), ...freecadInstallStatus() });
+        } catch (e) {
+          send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
+        }
+      },
+    }));
+
+    // 诊断日志：查看/导出插件运行日志（用于定位 FreeCAD 崩溃、路径、下载等问题）。
+    // GET 返回最近日志文本；POST 清空日志文件（可选）。
+    routeDisposers.push(server.register({
+      kind: 'prefix',
+      path: '/dsh-cam/log',
+      handler: async (req, res) => {
+        try {
+          const url = new URL(req.url ?? '/', 'http://localhost');
+          const maxLines = parseInt(url.searchParams.get('lines') || '2000', 10) || 2000;
+          if (req.method === 'POST') {
+            // 清空日志（保留 .1 备份不被删除，只清主文件）
+            try { writeFileSync(LOG_FILE, '', 'utf8'); } catch { /* ignore */ }
+            send(res, { ok: true, cleared: true });
+            return;
+          }
+          const text = readLogTail(maxLines);
+          let size = 0;
+          try { size = statSync(LOG_FILE).size; } catch { /* ignore */ }
+          send(res, {
+            ok: true,
+            file: LOG_FILE,
+            size,
+            lines: text ? text.split('\n').length : 0,
+            text,
+          });
         } catch (e) {
           send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
         }

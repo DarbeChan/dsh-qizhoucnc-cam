@@ -15,6 +15,12 @@ window.__ModuleLoader__.load({
     // 本插件注册更高优先级(extension)的 tab 类型接管 .nc/.cnc/.gcode，解码地址后在本插件编辑器打开。
     const FILE_ADDRESS_PREFIX = 'dsh-resource://file/';
     function basenameOf(path) { return String(path || '').split(/[\\/]/).filter(Boolean).pop() || path; }
+    function formatBytes(n) {
+      const v = Number(n) || 0;
+      if (v < 1024) return v + ' B';
+      if (v < 1024 * 1024) return (v / 1024).toFixed(1) + ' KB';
+      return (v / 1024 / 1024).toFixed(2) + ' MB';
+    }
     function isWindowsStylePath(value) { return /^[A-Za-z]:[/\\]/.test(value) || value.startsWith('\\\\'); }
     function isAbsoluteWorkspacePath(path) { return path.startsWith('/') || isWindowsStylePath(path); }
     function resolveWorkspacePath(cwd, path) {
@@ -1147,6 +1153,10 @@ window.__ModuleLoader__.load({
       const [showReward, setShowReward] = React.useState(false);
       // 打赏二维码双击放大（点击二维码图片放大显示）
       const [rewardZoomed, setRewardZoomed] = React.useState(false);
+      // 诊断日志弹窗 + 日志内容（导出/查看日志，定位问题用）
+      const [showLog, setShowLog] = React.useState(false);
+      const [logInfo, setLogInfo] = React.useState(null); // { file, size, lines, text } | null
+      const [logLoading, setLogLoading] = React.useState(false);
       // 版本更新检查（右下角：版本号 / 更新提醒 / 手动更新）
       const [versionInfo, setVersionInfo] = React.useState(null); // { current, latest, updateAvailable }
       const [updating, setUpdating] = React.useState(false); // 是否正在执行更新
@@ -1260,7 +1270,7 @@ window.__ModuleLoader__.load({
         return () => clearInterval(t);
       }, [loadChangedNc]);
 
-      // ESC 关闭全屏/弹窗：模型视窗放大 → 二维码放大 → 打赏弹窗，按优先级逐层退出。
+      // ESC 关闭全屏/弹窗：模型视窗放大 → 二维码放大 → 打赏弹窗 → 日志弹窗，按优先级逐层退出。
       React.useEffect(() => {
         if (typeof window === 'undefined') return;
         const onKey = (e) => {
@@ -1268,16 +1278,52 @@ window.__ModuleLoader__.load({
           if (modelMaximized) { setModelMaximized(false); return; }
           if (rewardZoomed) { setRewardZoomed(false); return; }
           if (showReward) { setShowReward(false); return; }
+          if (showLog) { setShowLog(false); return; }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-      }, [modelMaximized, rewardZoomed, showReward]);
+      }, [modelMaximized, rewardZoomed, showReward, showLog]);
 
       const post = React.useCallback((path, body) => fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).then((r) => r.json()), []);
 
       const reveal = React.useCallback((filePath) => {
         post('/dsh-cam/reveal', { file: filePath }).then((d) => { if (!d.ok) setErr(d.error || '打开失败'); }).catch((e) => setErr(String(e)));
       }, [post]);
+
+      // 打开日志弹窗并拉取最近日志
+      const openLog = React.useCallback(() => {
+        setShowLog(true);
+        setLogLoading(true);
+        fetch('/dsh-cam/log?lines=2000')
+          .then((r) => r.json())
+          .then((d) => { setLogInfo(d && d.ok ? d : null); })
+          .catch(() => setLogInfo(null))
+          .finally(() => setLogLoading(false));
+      }, []);
+
+      // 清空日志（主文件；备份 .1 保留）
+      const clearLog = React.useCallback(() => {
+        post('/dsh-cam/log', {})
+          .then(() => openLog())
+          .catch((e) => setErr(String(e)));
+      }, [post, openLog]);
+
+      // 把日志下载为 .log 文件
+      const downloadLog = React.useCallback(() => {
+        const text = (logInfo && logInfo.text) || '';
+        if (!text) { setErr('暂无日志内容可导出'); return; }
+        try {
+          const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'dsh-cam-' + new Date().toISOString().replace(/[:.]/g, '-') + '.log';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        } catch (e) { setErr(String(e)); }
+      }, [logInfo]);
 
       // choose a directory via the native picker, then add its NC/STEP files to the list
       const pickDirectory = React.useCallback(async () => {
@@ -2144,6 +2190,15 @@ window.__ModuleLoader__.load({
                 color: '#7c2d12', fontWeight: 700, padding: 0,
               },
             }, '¥'),
+            h('button', {
+              onClick: openLog,
+              title: '查看/导出诊断日志（定位 FreeCAD 崩溃、路径等问题）',
+              style: {
+                ...btn, fontSize: 11, padding: '3px 10px', border: 'none',
+                background: 'transparent', color: 'var(--dsw-alias-label-tertiary, #9ca3af)',
+                cursor: 'pointer',
+              },
+            }, '📋 日志'),
             // 右下角：版本号（无更新时）或 更新提醒 + 手动更新按钮
             h('span', { style: { flex: 1 } }),
             versionInfo && versionInfo.updateAvailable
@@ -2225,6 +2280,44 @@ window.__ModuleLoader__.load({
                   }),
                   h('div', { style: { fontSize: 13, color: '#4b5563' } }, '微信扫一扫 · 支持鼓励一下'),
                   h('button', { onClick: () => setRewardZoomed(false), style: { ...btn, fontSize: 13, padding: '4px 16px' } }, '收起')))
+            : null,
+          // 诊断日志弹窗（查看/复制/下载插件运行日志）
+          showLog
+            ? h('div', {
+                style: {
+                  position: 'fixed', inset: 0, zIndex: 3300,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  background: 'rgba(15, 23, 42, 0.55)',
+                },
+                onClick: () => setShowLog(false),
+              },
+                h('div', {
+                  style: {
+                    background: 'var(--dsw-alias-bg-base, #fff)', borderRadius: 14, padding: 16,
+                    boxShadow: '0 24px 80px rgba(0,0,0,0.35)', display: 'flex', flexDirection: 'column', gap: 10,
+                    width: 'min(720px, 92vw)', maxHeight: '82vh',
+                  },
+                  onClick: (e) => e.stopPropagation(),
+                },
+                  h('div', { style: { fontSize: 15, fontWeight: 700, color: '#1f2937', display: 'flex', alignItems: 'center', gap: 8 } },
+                    '诊断日志',
+                    h('span', { style: { fontSize: 11, fontWeight: 400, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } },
+                      logInfo ? ('文件：' + logInfo.file + ' · ' + logInfo.lines + ' 行 · ' + formatBytes(logInfo.size)) : '')),
+                  h('div', { style: { fontSize: 12, color: '#6b7280', lineHeight: '18px' } },
+                    '日志记录了插件启动、FreeCAD 探测/调用、模型加载、G 代码生成等每一步的耗时与错误详情。出现问题时把日志「下载」后发给我即可快速定位。'),
+                  h('div', {
+                    style: {
+                      flex: 1, minHeight: 200, overflow: 'auto', background: '#0f172a', color: '#cbd5e1',
+                      borderRadius: 8, padding: 10, fontSize: 11, lineHeight: '16px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                      whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                    },
+                  },
+                    logLoading ? '加载日志中…'
+                      : (logInfo && logInfo.text ? logInfo.text : '暂无日志（还没触发过相关操作）')),
+                  h('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
+                    h('button', { onClick: clearLog, style: { ...btn, fontSize: 12, padding: '4px 12px' } }, '清空'),
+                    h('button', { onClick: downloadLog, style: { ...btn, fontSize: 12, padding: '4px 12px' } }, '下载 .log'),
+                    h('button', { onClick: () => setShowLog(false), style: { ...btnPrimary, fontSize: 12, padding: '4px 16px' } }, '关闭'))))
             : null,
         )));
     }
