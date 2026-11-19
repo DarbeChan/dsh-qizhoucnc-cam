@@ -1,7 +1,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import z from '@deepseek-ai/schemastery';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync, rmdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync, rmdirSync, copyFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname, basename, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -352,33 +352,90 @@ function assertModelPath(modelPath) {
   return p;
 }
 
+// ---- stage files into a pure-ASCII temp dir before handing them to FreeCAD ----
+// freecadcmd can crash with "Application unexpectedly terminated" or fail to open a
+// file when the script path or model path contains non-ASCII characters (a Chinese
+// username, a Chinese project folder, or Chinese file names) — most common on Windows.
+// We copy the bundled .py script and the model into a fresh ASCII temp dir, run there,
+// and write the .nc back to its real location with Node (which handles Unicode paths).
+function hasNonAscii(s) {
+  return /[^\x00-\x7F]/.test(String(s));
+}
+
+// Pick a writable temp directory whose path is pure ASCII. tmpdir() is ASCII on
+// macOS/Linux and on Windows with an ASCII username, but on a Windows machine with a
+// Chinese username even %TEMP% contains Chinese — so we fall back to a fixed-ASCII dir.
+function asciiTmpDir(prefix) {
+  const candidates = [];
+  const t = tmpdir();
+  if (!hasNonAscii(t)) candidates.push(t);
+  if (process.platform === 'win32') {
+    candidates.push('C:\\Users\\Public');
+  } else {
+    candidates.push('/tmp');
+  }
+  for (const c of candidates) {
+    if (!c || hasNonAscii(c)) continue;
+    try { return mkdtempSync(join(c, prefix)); } catch { /* try next */ }
+  }
+  // last resort: tmpdir() even if non-ASCII (still better than failing outright)
+  return mkdtempSync(join(tmpdir(), prefix));
+}
+
+// Copy the bundled script + the model into one ASCII temp dir; returns the staged
+// paths and a cleanup() that removes them. The model keeps its original extension so
+// FreeCAD's Part.read still recognizes the format.
+function stageAsciiRun(modelPath, scriptPath, scriptName) {
+  const dir = asciiTmpDir('dsh-cam-');
+  const ext = (basename(modelPath).match(/\.([^.]+)$/) || [])[1] || 'stp';
+  const stagedScript = join(dir, scriptName);
+  const stagedModel = join(dir, 'model.' + ext);
+  copyFileSync(scriptPath, stagedScript);
+  copyFileSync(modelPath, stagedModel);
+  const cleanup = () => {
+    try {
+      for (const name of readdirSync(dir)) {
+        try { unlinkSync(join(dir, name)); } catch { /* ignore */ }
+      }
+      try { rmdirSync(dir); } catch { /* ignore */ }
+    } catch { /* ignore */ }
+  };
+  return { stagedScript, stagedModel, cleanup };
+}
+
 function tessellateModel(modelPath, opts = {}) {
   const freecadBin = resolveFreecadBin(opts.freecadBin);
   if (!freecadBin) throw new Error(freecadMissingError(opts.freecadBin));
   const p = assertModelPath(modelPath);
-  const tmp = mkdtempSync(join(tmpdir(), 'dsh-cam-model-'));
+  // Run FreeCAD from a pure-ASCII temp dir so non-ASCII script/model paths can't
+  // crash freecadcmd. Always stage (cheap, ~1 file copy) to keep one code path.
+  const { stagedScript, stagedModel, cleanup } = stageAsciiRun(p, MODEL_SCRIPT, 'model_tessellate.py');
+  const tmp = dirname(stagedModel);
   const outFile = join(tmp, 'model.json');
   const env = {
     ...process.env, LANG: 'en_US.UTF-8',
-    CAM_MODEL: p, CAM_MODEL_OUT: outFile,
+    CAM_MODEL: stagedModel, CAM_MODEL_OUT: outFile,
     CAM_TESS_TOL: String(opts.tol ?? 0.1),
   };
-  const res = spawnSync(freecadBin, [MODEL_SCRIPT], { env, encoding: 'utf8', timeout: 180_000, maxBuffer: 256 * 1024 * 1024 });
-  if (res.error) throw res.error;
-  if (!existsSync(outFile)) {
-    const tail = (res.stderr || res.stdout || '').trim().split('\n').slice(-12).join('\n');
-    throw new Error('FreeCAD tessellation failed to produce model JSON.\n' + tail);
-  }
   let scene;
   try {
-    scene = JSON.parse(readFileSync(outFile, 'utf8'));
-  } catch (e) {
-    throw new Error('Invalid tessellation JSON: ' + (e && e.message ? e.message : e));
+    const res = spawnSync(freecadBin, [stagedScript], { env, encoding: 'utf8', timeout: 180_000, maxBuffer: 256 * 1024 * 1024 });
+    if (res.error) throw res.error;
+    if (!existsSync(outFile)) {
+      const tail = (res.stderr || res.stdout || '').trim().split('\n').slice(-12).join('\n');
+      throw new Error('FreeCAD tessellation failed to produce model JSON.\n' + tail);
+    }
+    try {
+      scene = JSON.parse(readFileSync(outFile, 'utf8'));
+    } catch (e) {
+      throw new Error('Invalid tessellation JSON: ' + (e && e.message ? e.message : e));
+    }
   } finally {
-    try { unlinkSync(outFile); } catch { /* ignore */ }
-    try { rmdirSync(tmp); } catch { /* ignore */ }
+    cleanup();
   }
   if (!scene || scene.ok !== true) throw new Error('Tessellation failed: ' + (scene && scene.error ? scene.error : 'unknown'));
+  // restore the original model path so the client still labels the model correctly
+  if (typeof scene.file === 'string') scene.file = p;
   return scene;
 }
 
@@ -536,18 +593,28 @@ function generateToolpathFromModel(modelPath, opts = {}) {
   // write the NC file next to the model, with the same base name (panda.step -> panda.nc)
   const base = basename(p).replace(/\.[^.]+$/, '');
   const outFile = join(dirname(p), base + '.nc');
+  // Stage into a pure-ASCII temp dir (script + model + intermediate NC) so non-ASCII
+  // paths can't crash freecadcmd. The final .nc is written back to outFile by Node.
+  const { stagedScript, stagedModel, cleanup } = stageAsciiRun(p, CAM_SCRIPT, 'cam_script.py');
+  const stagedOut = join(dirname(stagedModel), 'out.nc');
   const env = {
     ...process.env, LANG: 'en_US.UTF-8',
-    CAM_MODEL: p, CAM_OUT: outFile,
+    CAM_MODEL: stagedModel, CAM_OUT: stagedOut,
     CAM_STEPDOWN: String(opts.stepDown ?? 2), CAM_FINALDEPTH: String(opts.finalDepth ?? 6), CAM_POST: String(opts.post ?? 'grbl'),
   };
-  const res = spawnSync(freecadBin, [CAM_SCRIPT], { env, encoding: 'utf8', timeout: 270_000, maxBuffer: 128 * 1024 * 1024 });
-  if (res.error) throw res.error;
-  if (!existsSync(outFile)) {
-    const tail = (res.stderr || res.stdout || '').trim().split('\n').slice(-12).join('\n');
-    throw new Error('FreeCAD CAM failed to produce G-code.\n' + tail);
+  let gcode;
+  try {
+    const res = spawnSync(freecadBin, [stagedScript], { env, encoding: 'utf8', timeout: 270_000, maxBuffer: 128 * 1024 * 1024 });
+    if (res.error) throw res.error;
+    if (!existsSync(stagedOut)) {
+      const tail = (res.stderr || res.stdout || '').trim().split('\n').slice(-12).join('\n');
+      throw new Error('FreeCAD CAM failed to produce G-code.\n' + tail);
+    }
+    gcode = readFileSync(stagedOut, 'utf8');
+    writeFileSync(outFile, gcode, 'utf8');
+  } finally {
+    cleanup();
   }
-  const gcode = readFileSync(outFile, 'utf8');
   const tp = buildToolpath(gcode);
   tp.file = outFile;
   latestToolpath = tp;

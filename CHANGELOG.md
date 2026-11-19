@@ -2,6 +2,14 @@
 
 本文件记录 DSH-QizhouCNC_CAM 的各版本变更。
 
+## [1.3.23] - 2026-11-20
+
+### 修复 (Fixed)
+
+- **其他电脑上模型加载报「FreeCAD tessellation failed to produce model JSON / Application unexpectedly terminated」**：FreeCAD（`freecadcmd`）在脚本路径或模型路径含非 ASCII 字符（中文用户名、中文项目文件夹、中文文件名）时可能直接崩溃或打不开文件，Windows 上最常见。之前直接把插件目录里的 `.py` 脚本和原模型路径传给 FreeCAD，路径里一旦带中文就触发。现改为在调用前把 `.py` 脚本和模型**复制到纯 ASCII 的临时目录**再运行，输出先写到该目录，最后再由 Node 把 `.nc` 写回原位置（Node 对 Unicode 路径没问题）。针对 Windows 中文用户名导致 `%TEMP%` 本身也含中文的情况，临时目录还会回退到 `C:\Users\Public`（Linux/macOS 回退 `/tmp`）。此修复已写入插件源码，升级后不再需要手动打补丁。
+
+---
+
 ## [1.3.22] - 2026-11-18
 
 ### 修复 (Fixed)
