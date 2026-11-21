@@ -266,26 +266,45 @@ function saveState(tp) {
   try { mkdirSync(dirname(STATE_FILE), { recursive: true }); writeFileSync(STATE_FILE, JSON.stringify(tp)); } catch { /* best effort */ }
 }
 
+// ---- 3+2 五轴（摇篮式 AC）正向运动学：A 绕 X、C 绕 Z ----
+// 程序坐标 (x,y,z) 是工件坐标系下的编程点；转台分度 (A,C) 后，刀尖在
+// 机床/显示空间的位置 = Rz(C) · Rx(A) · (x,y,z)（右手系）。
+// 变换顺序对应「转台 C 在下、摇篮 A 在上」的双转台 AC 构型。
+// A=C=0 时退化为恒等，纯三轴程序不受影响。
+const DEG = Math.PI / 180;
+function applyAc(p, A, C) {
+  if (!A && !C) return p;
+  const [x0, y0, z0] = p;
+  // 绕 X 转 A（摇篮）
+  const a = A * DEG, ca = Math.cos(a), sa = Math.sin(a);
+  const x1 = x0, y1 = y0 * ca - z0 * sa, z1 = y0 * sa + z0 * ca;
+  // 绕 Z 转 C（转台）
+  const c = C * DEG, cc = Math.cos(c), sc = Math.sin(c);
+  return [x1 * cc - y1 * sc, x1 * sc + y1 * cc, z1];
+}
+
 // ---- G-code -> ordered move list ----
 function parseGcode(gcode) {
-  let x = 0, y = 0, z = 0;
+  let x = 0, y = 0, z = 0, a = 0, c = 0;
   const moves = [];
   for (const raw of gcode.split('\n')) {
     const line = raw.split(';')[0].split('(')[0].trim();
     if (!line) continue;
-    let g = null, nx = x, ny = y, nz = z, i = 0, j = 0;
+    let g = null, nx = x, ny = y, nz = z, na = a, nc = c, i = 0, j = 0;
     for (const part of line.split(/\s+/)) {
       const u = part.toUpperCase();
       if (u.startsWith('G')) { const n = parseInt(u.slice(1), 10); if (!Number.isNaN(n)) g = n; }
       else if (u.startsWith('X')) nx = parseFloat(u.slice(1));
       else if (u.startsWith('Y')) ny = parseFloat(u.slice(1));
       else if (u.startsWith('Z')) nz = parseFloat(u.slice(1));
+      else if (u.startsWith('A')) na = parseFloat(u.slice(1));
+      else if (u.startsWith('C')) nc = parseFloat(u.slice(1));
       else if (u.startsWith('I')) i = parseFloat(u.slice(1));
       else if (u.startsWith('J')) j = parseFloat(u.slice(1));
     }
     if (g === 0 || g === 1 || g === 2 || g === 3) {
-      moves.push({ g, x, y, z, nx, ny, nz, i, j });
-      x = nx; y = ny; z = nz;
+      moves.push({ g, x, y, z, nx, ny, nz, i, j, a, c, na, nc });
+      x = nx; y = ny; z = nz; a = na; c = nc;
     }
   }
   return moves;
@@ -301,12 +320,27 @@ function buildToolpath(gcode) {
     cur.points.push(p);
   }
   for (const m of moves) {
+    const A0 = m.a, C0 = m.c;   // 本段起点姿态（parseGcode 已累积）
+    const A1 = m.na, C1 = m.nc; // 本段终点姿态
+
+    // 姿态分度段（A/C 变化）：转台/摇篮旋转、刀具静止，工件绕转台转动。
+    // 在显示上于此处断开刀路，不画旋转轨迹；下一段会以新姿态重新起笔。
+    if (A0 !== A1 || C0 !== C1) { cur = null; continue; }
+
+    // 姿态不变段：起点/终点用同一姿态变换（A0===A1 且 C0===C1）。
+    const pStart = applyAc([m.x, m.y, m.z], A0, C0);
+    const pEnd = applyAc([m.nx, m.ny, m.nz], A0, C0);
     if (m.g === 0 || m.g === 1) {
-      push([m.nx, m.ny, m.nz], m.g === 1);
+      push(pStart, m.g === 1);
+      push(pEnd, m.g === 1);
     } else {
       const cx = m.x + m.i, cy = m.y + m.j;
       const r = Math.hypot(m.x - cx, m.y - cy);
-      if (r < 1e-9) { push([m.nx, m.ny, m.nz], true); continue; }
+      if (r < 1e-9) {
+        push(pStart, true);
+        push(pEnd, true);
+        continue;
+      }
       let a0 = Math.atan2(m.y - cy, m.x - cx);
       let a1 = Math.atan2(m.ny - cy, m.nx - cx);
       let sweep;
@@ -316,7 +350,8 @@ function buildToolpath(gcode) {
       for (let k = 1; k <= n; k++) {
         const t = k / n;
         const a = a0 + sweep * t;
-        push([cx + r * Math.cos(a), cy + r * Math.sin(a), m.z + (m.nz - m.z) * t], true);
+        // 圆弧在 XY 平面插值，z 线性；整段姿态不变，统一做 AC 变换。
+        push(applyAc([cx + r * Math.cos(a), cy + r * Math.sin(a), m.z + (m.nz - m.z) * t], A0, C0), true);
       }
     }
   }

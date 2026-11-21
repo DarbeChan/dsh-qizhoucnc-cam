@@ -766,8 +766,9 @@ window.__ModuleLoader__.load({
       flex: 1, minWidth: 0, padding: '4px 10px', fontSize: 12, lineHeight: '20px',
       fontFamily: 'var(--dsw-alias-font-code, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace)',
       border: '1px solid var(--dsw-alias-border-l1, #d1d5db)', outline: 'none',
-      background: '#fff', color: 'var(--dsw-alias-label-primary, #1a1a1a)',
+      background: 'var(--dsw-alias-bg-layer-1, #fff)', color: 'var(--dsw-alias-label-primary, #1a1a1a)',
       borderRadius: 6, height: 28, boxSizing: 'border-box',
+      caretColor: 'var(--dsw-alias-label-primary, #1a1a1a)',
     };
 
     // React error boundary: catches any render crash inside the editor and shows the
