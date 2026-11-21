@@ -369,6 +369,13 @@ window.__ModuleLoader__.load({
       const [hoverHit, setHoverHit] = React.useState(null);
       const hoverThrottle = React.useRef(0);
       const W = 600, H = 460, cx = W / 2, cy = H / 2;
+      // 显示模式（对齐 DSH-CAD）：faces-edges=面+边、faces=仅面、wireframe=全是线
+      const RENDER_MODES = [
+        { id: 'faces-edges', label: '面+边' },
+        { id: 'faces', label: '面' },
+        { id: 'wireframe', label: '线' },
+      ];
+      const [renderMode, setRenderMode] = React.useState('faces-edges');
       // 多选集合的命中映射：kind:id -> true
       const selSetMap = React.useMemo(() => {
         const m = {};
@@ -570,7 +577,6 @@ window.__ModuleLoader__.load({
       ];
 
       const FACE_FILL = '#c7d2e0';
-      const FACE_STROKE = 'rgba(30,41,59,0.10)';
       const FACE_SELECTED = 'rgba(255,154,61,0.55)';
       const FACE_HOVER = 'rgba(77,107,254,0.35)';
       const EDGE_COLOR = '#64748b';
@@ -623,6 +629,11 @@ window.__ModuleLoader__.load({
         const baseFill = 'rgb(' + r + ',' + g + ',' + b + ')';
         // hover 灰亮高亮：用明显的蓝色半透明覆盖（而非微弱提亮），确保可见。
         const fillColor = isLoc ? LOCATE_FILL : (isFeat ? FEAT_FILL : ((isSel || isMultiSel) ? FACE_SELECTED : (isHover ? FACE_HOVER : baseFill)));
+        // 线框模式下不填面（只画边线）；其它模式填面。
+        const showFaceFill = renderMode !== 'wireframe';
+        // 面不再给每个三角形描边（消除网格外观），只在选中/标注/定位时描边。
+        const strokeColor = isLoc ? LOCATE_STROKE : (isFeat ? '#f97316' : ((isSel || isMultiSel) ? '#f97316' : (isHover ? '#2563eb' : 'none')));
+        const strokeW = isLoc ? 2.4 : (isFeat ? 0.8 : ((isSel || isMultiSel) ? 0.8 : (isHover ? 1.2 : 0)));
         let d = '';
         for (const tri of f.triangles) {
           const a = f.vertices[tri[0]], b = f.vertices[tri[1]], c = f.vertices[tri[2]];
@@ -634,9 +645,9 @@ window.__ModuleLoader__.load({
         faceEls.push(h('path', {
           key: 'f' + f.id,
           d,
-          fill: fillColor,
-          stroke: isLoc ? LOCATE_STROKE : (isFeat ? '#f97316' : ((isSel || isMultiSel) ? '#f97316' : FACE_STROKE)),
-          strokeWidth: isLoc ? 2.4 : (isFeat ? 0.8 : ((isSel || isMultiSel) ? 0.8 : 0.4)), strokeLinejoin: 'round',
+          fill: showFaceFill ? fillColor : 'none',
+          stroke: strokeColor,
+          strokeWidth: strokeW, strokeLinejoin: 'round',
           style: { cursor: 'pointer' },
           'data-hit': 'face', 'data-id': f.id,
         }));
@@ -649,14 +660,19 @@ window.__ModuleLoader__.load({
         const isFeat = featMap['edge:' + e.id];
         const isLoc = !!locateIdSet['edge:' + e.id];
         const isHover = !!hoverHit && hoverHit.kind === 'edge' && hoverHit.id === e.id;
+        // 显示模式：faces=仅面不显示边线；wireframe=全是线（边线加粗）；faces-edges=面+边。
+        const showEdges = renderMode !== 'faces';
+        if (!showEdges) continue;
+        const edgeBaseColor = renderMode === 'wireframe' ? 'var(--dsw-alias-label-primary, #111)' : EDGE_COLOR;
+        const edgeBaseWidth = renderMode === 'wireframe' ? 1.8 : 1.2;
         let pts = '';
         e.points.forEach((p, j) => { const [sx, sy] = toScreen(p); pts += (j === 0 ? '' : ' ') + sx.toFixed(1) + ',' + sy.toFixed(1); });
         edgeEls.push(h('polyline', {
           key: 'e' + e.id,
           points: pts,
           fill: 'none',
-          stroke: isLoc ? LOCATE_STROKE : (isFeat ? '#f97316' : ((isSel || isMultiSel) ? EDGE_SELECTED : (isHover ? '#2563eb' : EDGE_COLOR))),
-          strokeWidth: isLoc ? 4.4 : (isFeat ? 3.2 : ((isSel || isMultiSel) ? 3 : (isHover ? 2.6 : 1.4))),
+          stroke: isLoc ? LOCATE_STROKE : (isFeat ? '#f97316' : ((isSel || isMultiSel) ? EDGE_SELECTED : (isHover ? '#2563eb' : edgeBaseColor))),
+          strokeWidth: isLoc ? 4.4 : (isFeat ? 3.2 : ((isSel || isMultiSel) ? 3 : (isHover ? 2.6 : edgeBaseWidth))),
           strokeLinejoin: 'round', strokeLinecap: 'round',
           style: { cursor: 'pointer' },
           'data-hit': 'edge', 'data-id': e.id,
@@ -834,6 +850,19 @@ window.__ModuleLoader__.load({
           h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', marginRight: 2 } }, '视图'),
           VIEWS.map((v) => viewBtn(v, activeView === v)),
           h('button', { style: { padding: '1px 8px', fontSize: 11, cursor: 'pointer', borderRadius: 5, border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', background: 'transparent', color: 'var(--dsw-alias-label-primary, #111)' }, onClick: () => setView(fitView(0.7, 0.55)), title: '重置视图并适配' }, '重置'),
+          // 显示模式切换（对齐 DSH-CAD：面+边 / 面 / 线）
+          h('button', {
+            onClick: () => {
+              const cur = RENDER_MODES.findIndex((m) => m.id === renderMode);
+              setRenderMode(RENDER_MODES[(cur + 1) % RENDER_MODES.length].id);
+            },
+            title: '切换显示模式（面+边 / 仅面 / 全是线）',
+            style: {
+              padding: '1px 8px', fontSize: 11, cursor: 'pointer', borderRadius: 5,
+              border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', background: 'transparent',
+              color: 'var(--dsw-alias-label-primary, #111)',
+            },
+          }, RENDER_MODES.find((m) => m.id === renderMode).label),
           maxBtn),
         svgBlock({}),
         h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 } },
