@@ -369,11 +369,12 @@ window.__ModuleLoader__.load({
       const [hoverHit, setHoverHit] = React.useState(null);
       const hoverThrottle = React.useRef(0);
       const W = 600, H = 460, cx = W / 2, cy = H / 2;
-      // 显示模式（对齐 DSH-CAD）：faces-edges=面+边、faces=仅面、wireframe=全是线
+      // 显示模式（对齐 DSH-CAD）：faces-edges=面+边、faces=仅面、wireframe=全是线、xray=X光
       const RENDER_MODES = [
         { id: 'faces-edges', label: '面+边' },
         { id: 'faces', label: '面' },
         { id: 'wireframe', label: '线' },
+        { id: 'xray', label: 'X光' },
       ];
       const [renderMode, setRenderMode] = React.useState('faces-edges');
       // 多选集合的命中映射：kind:id -> true
@@ -581,6 +582,7 @@ window.__ModuleLoader__.load({
       const FACE_HOVER = 'rgba(77,107,254,0.35)';
       const EDGE_COLOR = '#64748b';
       const EDGE_SELECTED = '#ff9a3d';
+      const EDGE_XRAY = 'rgba(148,163,184,0.55)'; // X光模式：被前景遮住的边用浅灰虚线（透视效果）
       const FEAT_FILL = 'rgba(255,154,61,0.72)'; // 已标注特征：橙色高亮
       const LOCATE_FILL = 'rgba(34,197,94,0.85)'; // 点击标签定位：亮绿高亮
       const LOCATE_STROKE = '#16a34a';
@@ -612,11 +614,72 @@ window.__ModuleLoader__.load({
         return 0.34 + 0.66 * Math.max(0, nd);
       };
 
+      // ---- 深度预计算：每个面的视图深度（画家算法排序）+ 屏幕投影（边隐藏线消除）----
+      // depth 越大 = 越靠前（与 hitTest 一致：hitTest 取 depth 最大者为最前面的面）。
+      // EPS 用于区分「边贴着的自身面」与「真正遮住边的前景面」，避免自身面因离散化误差误判为遮挡。
+      const EPS = Math.max(0.5, R * 0.01);
+      const faceMeta = [];
+      for (const f of scene.faces) {
+        let cx0 = 0, cy0 = 0, cz0 = 0, vn = 0;
+        if (Array.isArray(f.center) && f.center.length >= 3) {
+          cx0 = f.center[0]; cy0 = f.center[1]; cz0 = f.center[2];
+        } else {
+          for (const tri of f.triangles) {
+            for (const idx of tri) {
+              const v = f.vertices[idx];
+              if (v) { cx0 += v[0]; cy0 += v[1]; cz0 += v[2]; vn++; }
+            }
+          }
+          if (vn) { cx0 /= vn; cy0 /= vn; cz0 /= vn; }
+        }
+        const cc = xf ? applyAssetTransform([cx0, cy0, cz0], xf) : [cx0, cy0, cz0];
+        const depth = rotateView([cc[0] - tpv[0], cc[1] - tpv[1], cc[2] - tpv[2]], view.yaw, view.pitch)[2];
+        const tris = [];
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const tri of f.triangles) {
+          const a = f.vertices[tri[0]], b = f.vertices[tri[1]], c = f.vertices[tri[2]];
+          if (!a || !b || !c) continue;
+          const [ax, ay, ad] = toView(a), [bx, by, bd] = toView(b), [cx2, cy2, cd] = toView(c);
+          tris.push([ax, ay, ad, bx, by, bd, cx2, cy2, cd]);
+          if (ax < minX) minX = ax; if (ax > maxX) maxX = ax;
+          if (ay < minY) minY = ay; if (ay > maxY) maxY = ay;
+          if (bx < minX) minX = bx; if (bx > maxX) maxX = bx;
+          if (by < minY) minY = by; if (by > maxY) maxY = by;
+          if (cx2 < minX) minX = cx2; if (cx2 > maxX) maxX = cx2;
+          if (cy2 < minY) minY = cy2; if (cy2 > maxY) maxY = cy2;
+        }
+        faceMeta.push({ f, depth, tris, minX, minY, maxX, maxY });
+      }
+      // 画家算法：按深度升序（远 → 近）绘制面；近的面最后画，实心遮住远的面。
+      const faceOrder = faceMeta.slice().sort((a, b) => a.depth - b.depth);
+
+      // 边隐藏线消除：判断某条边是否被「更靠近视点」的面遮住（取边点的重心作采样点）。
+      const edgeOccluded = (pts) => {
+        if (!pts || pts.length < 2) return false;
+        let mx = 0, my = 0, mz = 0, n = 0;
+        for (const p of pts) { mx += p[0]; my += p[1]; mz += p[2]; n++; }
+        if (!n) return false;
+        const q = xf ? applyAssetTransform([mx / n, my / n, mz / n], xf) : [mx / n, my / n, mz / n];
+        const [sx, sy, sd] = toView(q);
+        for (const fm of faceMeta) {
+          if (sx < fm.minX || sx > fm.maxX || sy < fm.minY || sy > fm.maxY) continue;
+          for (const t of fm.tris) {
+            const [ax, ay, ad, bx, by, bd, cx2, cy2, cd] = t;
+            const bc = barycentric(sx, sy, ax, ay, bx, by, cx2, cy2);
+            if (!bc) continue;
+            const depth = ad * bc.u + bd * bc.v + cd * bc.w;
+            if (depth > sd + EPS) return true; // 被前景面遮住
+          }
+        }
+        return false;
+      };
+
       // faces → ONE <path> per face (merge all its triangles into a single path).
       // 每个三角形若独立成 <polygon>，复杂 STEP 会有上万 DOM 节点导致崩溃；
       // 合并成单 path 后，DOM 节点数 = 面数，性能与内存都安全。
+      // 按画家算法远→近排序绘制：消除「背面透过正面」的透明感，得到实心不透明效果。
       const faceEls = [];
-      for (const f of scene.faces) {
+      for (const { f } of faceOrder) {
         const isSel = selected && selected.kind === 'face' && selected.id === f.id;
         const isMultiSel = !!selSetMap['face:' + f.id];
         const isFeat = featMap['face:' + f.id];
@@ -625,7 +688,7 @@ window.__ModuleLoader__.load({
         // 消除「hover 看到的面 ≠ 点击锁定的面」的跳变。
         const isHover = !!hoverHit && hoverHit.kind === 'face' && hoverHit.id === f.id;
         const shade = shadeOf(faceNormal(f));
-        const r = Math.round(96 * shade), g = Math.round(116 * shade), b = Math.round(140 * shade);
+        const r = Math.round(159 * shade), g = Math.round(180 * shade), b = Math.round(199 * shade);
         const baseFill = 'rgb(' + r + ',' + g + ',' + b + ')';
         // hover 灰亮高亮：用明显的蓝色半透明覆盖（而非微弱提亮），确保可见。
         const fillColor = isLoc ? LOCATE_FILL : (isFeat ? FEAT_FILL : ((isSel || isMultiSel) ? FACE_SELECTED : (isHover ? FACE_HOVER : baseFill)));
@@ -653,6 +716,8 @@ window.__ModuleLoader__.load({
         }));
       }
       // edges as individual <polyline> for picking
+      // 隐藏线消除：faces-edges 模式下被前景遮住的边不画（对齐 DSH-CAD shaded-edges）；
+      // X光 模式下所有边都画，被遮住的边用浅灰虚线（X 光透视）；wireframe 画全部边。
       const edgeEls = [];
       for (const e of scene.edges) {
         const isSel = selected && selected.kind === 'edge' && selected.id === e.id;
@@ -660,9 +725,15 @@ window.__ModuleLoader__.load({
         const isFeat = featMap['edge:' + e.id];
         const isLoc = !!locateIdSet['edge:' + e.id];
         const isHover = !!hoverHit && hoverHit.kind === 'edge' && hoverHit.id === e.id;
-        // 显示模式：faces=仅面不显示边线；wireframe=全是线（边线加粗）；faces-edges=面+边。
+        // 显示模式：faces=仅面不显示边线；wireframe=全是线（边线加粗）；faces-edges=面+边（隐藏线消除）；xray=X光。
         const showEdges = renderMode !== 'faces';
         if (!showEdges) continue;
+        // 仅在需要隐藏线消除的模式下做遮挡测试（wireframe 全画、faces 无边线，都不需要）。
+        const needHidden = renderMode === 'faces-edges' || renderMode === 'xray';
+        const hidden = needHidden ? edgeOccluded(e.points) : false;
+        // 面+边 模式：隐藏被前景遮住的边（实心模型的背面边不显示）。
+        if (renderMode === 'faces-edges' && hidden) continue;
+        const xrayHidden = renderMode === 'xray' && hidden;
         const edgeBaseColor = renderMode === 'wireframe' ? 'var(--dsw-alias-label-primary, #111)' : EDGE_COLOR;
         const edgeBaseWidth = renderMode === 'wireframe' ? 1.8 : 1.2;
         let pts = '';
@@ -671,8 +742,9 @@ window.__ModuleLoader__.load({
           key: 'e' + e.id,
           points: pts,
           fill: 'none',
-          stroke: isLoc ? LOCATE_STROKE : (isFeat ? '#f97316' : ((isSel || isMultiSel) ? EDGE_SELECTED : (isHover ? '#2563eb' : edgeBaseColor))),
+          stroke: isLoc ? LOCATE_STROKE : (isFeat ? '#f97316' : ((isSel || isMultiSel) ? EDGE_SELECTED : (isHover ? '#2563eb' : (xrayHidden ? EDGE_XRAY : edgeBaseColor)))),
           strokeWidth: isLoc ? 4.4 : (isFeat ? 3.2 : ((isSel || isMultiSel) ? 3 : (isHover ? 2.6 : edgeBaseWidth))),
+          strokeDasharray: xrayHidden ? '3 3' : undefined,
           strokeLinejoin: 'round', strokeLinecap: 'round',
           style: { cursor: 'pointer' },
           'data-hit': 'edge', 'data-id': e.id,
@@ -856,7 +928,7 @@ window.__ModuleLoader__.load({
               const cur = RENDER_MODES.findIndex((m) => m.id === renderMode);
               setRenderMode(RENDER_MODES[(cur + 1) % RENDER_MODES.length].id);
             },
-            title: '切换显示模式（面+边 / 仅面 / 全是线）',
+            title: '切换显示模式（面+边 / 仅面 / 全是线 / X光）',
             style: {
               padding: '1px 8px', fontSize: 11, cursor: 'pointer', borderRadius: 5,
               border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', background: 'transparent',
