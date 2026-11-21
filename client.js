@@ -1521,6 +1521,16 @@ window.__ModuleLoader__.load({
               setModelFile(p);
               loadFeatures(p);
               loadAssets(p);
+              // 从后端恢复该模型上次保存的位置参数（位移/旋转）
+              fetch('/dsh-cam/main-transform?model=' + encodeURIComponent(p))
+                .then((r) => r.json())
+                .then((d) => {
+                  if (d && d.ok && d.transform) {
+                    setMainTransform(d.transform);
+                    setMainTf({ translate: d.transform.translate.slice(0, 3), rotate: d.transform.rotate.slice(0, 3) });
+                  }
+                })
+                .catch(() => {});
             } else {
               setErr((d && d.error) || '模型加载失败');
             }
@@ -1620,6 +1630,7 @@ window.__ModuleLoader__.load({
       const FALLBACK_SKILLS = [
         { name: 'cnc-process-card', title: 'CNC 工艺卡', description: '生成 CNC 加工 MD 工艺卡' },
         { name: 'cnc-auto-annotate', title: 'CNC 自动标注', description: '按工艺卡自动标注刀具/坐标系' },
+        { name: 'cnc-stock-diff', title: '毛坯差异计算', description: '毛坯−成品布尔求差，计算待去除材料' },
       ];
       const loadSkills = React.useCallback(() => {
         fetch('/dsh-cam/skills')
@@ -1732,6 +1743,29 @@ window.__ModuleLoader__.load({
           .catch((e) => setErr('更新失败：' + String(e)))
           .finally(() => setUpdating(false));
       }, [versionInfo, updating, checkVersion]);
+
+      // 点击版本号：先获取最新版本，若有更新则自动触发更新。
+      const clickVersion = React.useCallback(() => {
+        if (updating) return;
+        setErr(null);
+        // 重新查询最新版本，然后有更新则自动更新
+        fetch('/dsh-cam/version')
+          .then((r) => r.json())
+          .then((d) => {
+            if (d && d.ok) {
+              const info = { current: d.current, latest: d.latest, updateAvailable: !!d.updateAvailable };
+              setVersionInfo(info);
+              if (d.updateAvailable) {
+                // 有新版本：直接触发自动更新
+                setErr('发现新版本 v' + d.latest + '，正在自动更新…');
+                doUpdate();
+              } else {
+                setErr('当前已是最新版本 v' + (d.current || ''));
+              }
+            }
+          })
+          .catch(() => setErr('检查版本失败'));
+      }, [updating, doUpdate]);
 
       // 拉取该模型已写入的「识别文件」标注
       const loadFeatures = React.useCallback((modelPath) => {
@@ -1923,12 +1957,21 @@ window.__ModuleLoader__.load({
         return { ...prev, [axis]: n };
       });
       const applyMainTransform = React.useCallback(() => {
-        setMainTransform({ translate: mainTf.translate.slice(0, 3), rotate: mainTf.rotate.slice(0, 3) });
-      }, [mainTf]);
+        const tf = { translate: mainTf.translate.slice(0, 3), rotate: mainTf.rotate.slice(0, 3) };
+        setMainTransform(tf);
+        // 持久化到后端（供 agent 通过工具读取成品模型工件坐标）
+        if (modelFile) {
+          post('/dsh-cam/main-transform', { model: modelFile, transform: tf }).catch(() => {});
+        }
+      }, [mainTf, modelFile, post]);
       const resetMainTransform = React.useCallback(() => {
         setMainTransform(null);
         setMainTf({ translate: [0, 0, 0], rotate: [0, 0, 0] });
-      }, []);
+        // 清除后端持久化的位置参数
+        if (modelFile) {
+          post('/dsh-cam/main-transform', { model: modelFile, transform: null }).catch(() => {});
+        }
+      }, [modelFile, post]);
 
       const ncCount = files.nc.length;
 
@@ -2436,7 +2479,7 @@ window.__ModuleLoader__.load({
                 cursor: 'pointer',
               },
             }, '🧩 支持技能'),
-            // 右下角：版本号（无更新时）或 更新提醒 + 手动更新按钮
+            // 右下角：版本号（点击获取最新并自动更新）+ 更新提醒 + 手动更新按钮
             h('span', { style: { flex: 1 } }),
             versionInfo && versionInfo.updateAvailable
               ? h(React.Fragment, null,
@@ -2449,10 +2492,16 @@ window.__ModuleLoader__.load({
                     style: { ...btn, fontSize: 11, padding: '2px 10px', fontWeight: 600, borderColor: 'var(--dsw-alias-state-business-primary, #2563eb)', color: 'var(--dsw-alias-state-business-primary, #2563eb)' },
                     title: '点击更新到 v' + versionInfo.latest,
                   }, updating ? '更新中…' : '更新'))
-              : h('span', {
-                  style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' },
-                  title: '当前版本',
-                }, 'v' + (versionInfo ? versionInfo.current : '…'))),
+              : h('button', {
+                  onClick: clickVersion,
+                  disabled: updating,
+                  title: '点击获取最新版本并自动更新',
+                  style: {
+                    fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)',
+                    cursor: 'pointer', border: 'none', background: 'transparent', padding: '2px 4px',
+                  },
+                }, 'v' + (versionInfo ? versionInfo.current : '…') + (updating ? ' 更新中…' : ''))),
+          // 打赏二维码弹窗
           // 打赏二维码弹窗
           showReward
             ? h('div', {

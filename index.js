@@ -22,6 +22,7 @@ const FREECAD_BIN_CANDIDATES = [
 const CAM_SCRIPT = join(__dirname, 'cam_script.py');
 const RENDER_SCRIPT = join(__dirname, 'toolpath_render.py');
 const MODEL_SCRIPT = join(__dirname, 'model_tessellate.py');
+const DIFF_SCRIPT = join(__dirname, 'stock_diff.py');
 const STATE_FILE = join(homedir(), '.dsh', 'storages', 'dsh-cam-toolpath.json');
 const WORKSPACE_STORE = join(homedir(), '.dsh', 'storages', 'workspace.json');
 
@@ -410,6 +411,8 @@ function scanFiles(rootDir, extRe, maxDepth = 5) {
 const MODEL_EXT = /\.(step|stp|brep|iges|igs)$/i;
 const FEATURE_FILE = join(homedir(), '.dsh', 'storages', 'dsh-cam-features.json');
 const ASSETS_FILE = join(homedir(), '.dsh', 'storages', 'dsh-cam-assets.json');
+// 主模型（成品）的位置参数：modelPath -> { translate:[x,y,z], rotate:[rx,ry,rz] }
+const MAIN_TRANSFORM_FILE = join(homedir(), '.dsh', 'storages', 'dsh-cam-main-transform.json');
 
 function assertModelPath(modelPath) {
   const p = resolvePath(modelPath);
@@ -526,6 +529,72 @@ function tessellateModel(modelPath, opts = {}) {
   return scene;
 }
 
+// ---- 毛坯 - 成品 布尔差：计算需要被加工去除的材料 ----
+// 用 FreeCAD 做布尔差，网格化结果供模型视窗叠加显示（绿色半透明），并返回体积/包围盒。
+function stockDifference(stockPath, partPath, opts = {}) {
+  const freecadBin = resolveFreecadBin(opts.freecadBin);
+  if (!freecadBin) {
+    const e = new Error(freecadMissingError(opts.freecadBin));
+    log('error', 'diff:no-freecad', e);
+    throw e;
+  }
+  const sp = resolvePath(stockPath);
+  const pp = resolvePath(partPath);
+  if (!existsSync(sp)) throw new Error('Stock model not found: ' + sp);
+  if (!existsSync(pp)) throw new Error('Part model not found: ' + pp);
+  // Stage both models + script into a pure-ASCII temp dir (avoid non-ASCII path crash)
+  const dir = asciiTmpDir('dsh-cam-diff-');
+  const extS = (basename(sp).match(/\.([^.]+)$/) || [])[1] || 'stp';
+  const extP = (basename(pp).match(/\.([^.]+)$/) || [])[1] || 'stp';
+  const stagedScript = join(dir, 'stock_diff.py');
+  const stagedStock = join(dir, 'stock.' + extS);
+  const stagedPart = join(dir, 'part.' + extP);
+  const outFile = join(dir, 'diff.json');
+  copyFileSync(DIFF_SCRIPT, stagedScript);
+  copyFileSync(sp, stagedStock);
+  copyFileSync(pp, stagedPart);
+  const cleanup = () => {
+    try {
+      for (const name of readdirSync(dir)) { try { unlinkSync(join(dir, name)); } catch { /* ignore */ } }
+      try { rmdirSync(dir); } catch { /* ignore */ }
+    } catch { /* ignore */ }
+  };
+  const env = {
+    ...process.env, LANG: 'en_US.UTF-8',
+    CAM_STOCK: stagedStock, CAM_PART: stagedPart, CAM_DIFF_OUT: outFile,
+  };
+  log('info', 'diff:start', { stock: sp, part: pp, freecadBin });
+  let result;
+  try {
+    const res = spawnSync(freecadBin, [stagedScript], { env, encoding: 'utf8', timeout: 180_000, maxBuffer: 256 * 1024 * 1024 });
+    log('info', 'diff:spawn-done', {
+      stock: sp, part: pp,
+      status: res.status, signal: res.signal,
+      stdoutTail: (res.stdout || '').trim().split('\n').slice(-10).join('\n'),
+      stderrTail: (res.stderr || '').trim().split('\n').slice(-10).join('\n'),
+    });
+    if (res.error) throw res.error;
+    if (!existsSync(outFile)) {
+      const tail = (res.stderr || res.stdout || '').trim().split('\n').slice(-12).join('\n');
+      const e = new Error('FreeCAD boolean difference failed to produce JSON.\n' + tail);
+      log('error', 'diff:no-json', { stock: sp, part: pp, stderr: (res.stderr || '').slice(-4000), stdout: (res.stdout || '').slice(-4000) });
+      throw e;
+    }
+    result = JSON.parse(readFileSync(outFile, 'utf8'));
+  } finally {
+    cleanup();
+  }
+  if (!result || result.ok !== true) {
+    const e = new Error('Boolean difference failed: ' + (result && result.error ? result.error : 'unknown'));
+    log('error', 'diff:not-ok', e);
+    throw e;
+  }
+  result.stock = sp;
+  result.part = pp;
+  log('info', 'diff:done', { stock: sp, part: pp, volume: result.volume, faces: result.faceCount, empty: result.empty });
+  return result;
+}
+
 // ---- read / append machining-position features (named face/edge annotations) ----
 function loadFeatures() {
   try { return JSON.parse(readFileSync(FEATURE_FILE, 'utf8')) || {}; } catch { return {}; }
@@ -618,6 +687,31 @@ function normalizeTransform(t) {
   if (!t || typeof t !== 'object') return { translate: [0, 0, 0], rotate: [0, 0, 0] };
   const to3 = (v, dflt) => Array.isArray(v) ? v.slice(0, 3).map((n) => Number(n) || 0) : dflt;
   return { translate: to3(t.translate, [0, 0, 0]), rotate: to3(t.rotate, [0, 0, 0]) };
+}
+
+// ---- 主模型（成品）位置参数持久化：modelPath -> { translate, rotate } ----
+function loadMainTransforms() {
+  try { return JSON.parse(readFileSync(MAIN_TRANSFORM_FILE, 'utf8')) || {}; } catch { return {}; }
+}
+function saveMainTransforms(all) {
+  try {
+    mkdirSync(dirname(MAIN_TRANSFORM_FILE), { recursive: true });
+    writeFileSync(MAIN_TRANSFORM_FILE, JSON.stringify(all, null, 2), 'utf8');
+  } catch { /* ignore */ }
+}
+// 保存/读取某个模型的位置参数；transform 为 null 表示清除（复位）
+function setMainTransform(modelPath, transform) {
+  const p = resolvePath(modelPath);
+  const all = loadMainTransforms();
+  if (transform === null || transform === undefined) delete all[p];
+  else all[p] = normalizeTransform(transform);
+  saveMainTransforms(all);
+  return all[p] ?? null;
+}
+function getMainTransform(modelPath) {
+  const p = resolvePath(modelPath);
+  const all = loadMainTransforms();
+  return all[p] ?? null;
 }
 // add or replace a fixture/blank by tessellating its STEP now; returns the updated list
 function upsertAsset(modelPath, asset, opts = {}) {
@@ -756,6 +850,13 @@ export function apply(ctx, config = {}) {
       description:
         '根据 CNC 工艺卡，自动在 qizhouCNC_CAM 中标注成品零件的加工特征——每个面/边用什么刀具、什么坐标系。' +
         '当用户提供工艺卡（或上一轮已生成）和成品模型，要求自动标注、标注刀具与坐标系时使用。',
+    },
+    {
+      name: 'cnc-stock-diff',
+      title: '毛坯差异计算',
+      description:
+        '计算毛坯与成品模型的差异（布尔差：毛坯−成品），得出需要被加工去除的材料体积与区域，并读取成品模型工件坐标与加工坐标位置。' +
+        '当用户提供毛坯和成品模型、要求分析加工余量、判断需要去除哪些材料、或读取模型位置参数时使用。',
     },
   ];
 
@@ -977,6 +1078,27 @@ export function apply(ctx, config = {}) {
       },
     }));
 
+    // 毛坯 - 成品 布尔差：返回待去除材料的网格化场景（供模型视窗叠加显示）
+    routeDisposers.push(server.register({
+      kind: 'prefix',
+      path: '/dsh-cam/stock-diff',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { send(res, { ok: false, error: 'POST only' }, 405); return; }
+        const parsed = await readBody(req);
+        try {
+          const result = stockDifference(parsed.stock, parsed.part, { freecadBin });
+          send(res, {
+            ok: true, stock: result.stock, part: result.part,
+            volume: result.volume, empty: !!result.empty, bounds: result.bounds,
+            faces: result.faces, edges: result.edges,
+            faceCount: result.faceCount, edgeCount: result.edgeCount,
+          });
+        } catch (e) {
+          send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
+        }
+      },
+    }));
+
     // read the machining-position features recorded for a model
     routeDisposers.push(server.register({
       kind: 'prefix',
@@ -1042,6 +1164,30 @@ export function apply(ctx, config = {}) {
           const all = loadAssets();
           const p = resolvePath(model);
           send(res, { ok: true, model: p, assets: Array.isArray(all[p]) ? all[p] : [] });
+        } catch (e) {
+          send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
+        }
+      },
+    }));
+
+    // 主模型（成品）位置参数：GET 读、POST 存（transform=null 清除）
+    routeDisposers.push(server.register({
+      kind: 'prefix',
+      path: '/dsh-cam/main-transform',
+      handler: async (req, res) => {
+        try {
+          const url = new URL(req.url ?? '/', 'http://localhost');
+          const model = url.searchParams.get('model');
+          if (req.method === 'POST') {
+            const parsed = await readBody(req);
+            const key = parsed.model ?? url.searchParams.get('model');
+            if (!key) { send(res, { ok: false, error: 'model query param required' }, 400); return; }
+            const tf = setMainTransform(key, parsed.transform ?? null);
+            send(res, { ok: true, model: resolvePath(key), transform: tf });
+            return;
+          }
+          if (!model) { send(res, { ok: false, error: 'model query param required' }, 400); return; }
+          send(res, { ok: true, model: resolvePath(model), transform: getMainTransform(model) });
         } catch (e) {
           send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
         }
@@ -1431,12 +1577,93 @@ export function apply(ctx, config = {}) {
     presentCall: (args) => ({ card: 'generic', title: `Annotate ${args.path}`, kind: 'write' }),
   });
 
+  // ---- 读取成品模型工件坐标（位置参数：位移/旋转，含用户在模型视窗修改后保存的值）----
+  const camGetModelPose = defineTool({
+    name: 'cam_get_model_pose',
+    description:
+      'Read the current work-coordinate pose of a part model (the translate/rotate the user set in the ' +
+      'model viewport, persisted on "apply"). Returns { translate:[x,y,z] mm, rotate:[rx,ry,rz] deg } or null ' +
+      'when the model has no saved pose. Use to understand the part\'s position/orientation in the machine frame.',
+    parameters: {
+      path: { type: 'string', required: true, description: 'Path to the part model (.step/.stp/.brep/.iges).' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          model: { type: 'string', required: true },
+          transform: { type: 'object', additionalProperties: true, required: true, description: '{ translate:[x,y,z], rotate:[rx,ry,rz] } or null.' },
+        },
+      },
+      render: (_args, value) => {
+        const t = value.transform;
+        const text = t
+          ? `Model pose: translate (${t.translate.map((v) => +v.toFixed(3)).join(', ')}) mm, rotate (${t.rotate.map((v) => +v.toFixed(2)).join(', ')}) deg.`
+          : 'Model has no saved pose (identity).';
+        return [{ type: 'text', text }];
+      },
+    },
+    timeoutMs: 10_000,
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      const p = resolvePath(args.path);
+      return { model: p, transform: getMainTransform(p) };
+    },
+    presentCall: (args) => ({ card: 'generic', title: `Model pose ${args.path}`, kind: 'read' }),
+  });
+
+  // ---- 毛坯 - 成品 布尔差：计算需要被加工去除的材料 ----
+  const camStockDifference = defineTool({
+    name: 'cam_stock_difference',
+    description:
+      'Compute the material to remove by boolean-differencing the blank/stock model and the finished ' +
+      'part model (stock − part). Returns the removed-material volume (mm^3), bounding box, and ' +
+      'face/edge counts. Use to quickly understand how much material must be machined away from the blank; ' +
+      'the full tessellated scene (for viewport overlay) is available via the /dsh-cam/stock-diff route.',
+    parameters: {
+      stock: { type: 'string', required: true, description: 'Path to the blank/stock model (.step/.stp/.brep/.iges).' },
+      part: { type: 'string', required: true, description: 'Path to the finished part model (.step/.stp/.brep/.iges).' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          stock: { type: 'string', required: true },
+          part: { type: 'string', required: true },
+          volume: { type: 'number', required: true, description: 'Material to remove, mm^3.' },
+          empty: { type: 'boolean', required: true, description: 'True when nothing to remove.' },
+          bounds: { type: 'object', additionalProperties: true, required: true },
+          faceCount: { type: 'number', required: true },
+          edgeCount: { type: 'number', required: true },
+        },
+      },
+      render: (_args, value) => {
+        const text = value.empty
+          ? 'Nothing to remove: the stock already matches the part.'
+          : `Material to remove: ${(+value.volume).toLocaleString()} mm³ (${value.faceCount} faces, ${value.edgeCount} edges). Bounding box ${value.bounds.min.join(',')} ~ ${value.bounds.max.join(',')}.`;
+        return [{ type: 'text', text }];
+      },
+    },
+    timeoutMs: 200_000,
+    isConcurrencySafe: () => false,
+    async execute(args) {
+      const r = stockDifference(args.stock, args.part, { freecadBin });
+      return {
+        stock: r.stock, part: r.part, volume: r.volume, empty: !!r.empty,
+        bounds: r.bounds, faceCount: r.faceCount, edgeCount: r.edgeCount,
+      };
+    },
+    presentCall: (args) => ({ card: 'generic', title: `Stock difference ${args.stock}`, kind: 'read' }),
+  });
+
   const disposers = [
     ctx.tools.register(camGenerate),
     ctx.tools.register(camLoad),
     ctx.tools.register(camRender),
     ctx.tools.register(camInspectModel),
     ctx.tools.register(camAnnotateFeature),
+    ctx.tools.register(camGetModelPose),
+    ctx.tools.register(camStockDifference),
   ];
 
   // 斜杠命令 /dsh-qizhoucnc-cam：可带 STEP 模型附件，把「生成/查看刀路」请求注入给模型。
