@@ -266,24 +266,11 @@ function saveState(tp) {
   try { mkdirSync(dirname(STATE_FILE), { recursive: true }); writeFileSync(STATE_FILE, JSON.stringify(tp)); } catch { /* best effort */ }
 }
 
-// ---- 3+2 五轴（摇篮式 AC）正向运动学：A 绕 X、C 绕 Z ----
-// 程序坐标 (x,y,z) 是工件坐标系下的编程点；转台分度 (A,C) 后，刀尖在
-// 机床/显示空间的位置 = Rz(C) · Rx(A) · (x,y,z)（右手系）。
-// 变换顺序对应「转台 C 在下、摇篮 A 在上」的双转台 AC 构型。
-// A=C=0 时退化为恒等，纯三轴程序不受影响。
-const DEG = Math.PI / 180;
-function applyAc(p, A, C) {
-  if (!A && !C) return p;
-  const [x0, y0, z0] = p;
-  // 绕 X 转 A（摇篮）
-  const a = A * DEG, ca = Math.cos(a), sa = Math.sin(a);
-  const x1 = x0, y1 = y0 * ca - z0 * sa, z1 = y0 * sa + z0 * ca;
-  // 绕 Z 转 C（转台）
-  const c = C * DEG, cc = Math.cos(c), sc = Math.sin(c);
-  return [x1 * cc - y1 * sc, x1 * sc + y1 * cc, z1];
-}
-
 // ---- G-code -> ordered move list ----
+// 注意：FANUC 3+2 定轴程序的 X/Y/Z 已经是「旋转到位后的最终加工坐标」，
+// Z 就是主轴进给方向（钻孔沿 Z 负、铣面在 XY 平面），不需要再按 A/C 姿态做
+// 正向运动学旋转。此前错误地做了 Rz(C)·Rx(A) 变换，把钻孔方向转成了水平，
+// 导致刀路显示错误。这里只累积 A/C（用于显示姿态信息），坐标原样使用。
 function parseGcode(gcode) {
   let x = 0, y = 0, z = 0, a = 0, c = 0;
   const moves = [];
@@ -320,25 +307,18 @@ function buildToolpath(gcode) {
     cur.points.push(p);
   }
   for (const m of moves) {
-    const A0 = m.a, C0 = m.c;   // 本段起点姿态（parseGcode 已累积）
-    const A1 = m.na, C1 = m.nc; // 本段终点姿态
-
-    // 姿态分度段（A/C 变化）：转台/摇篮旋转、刀具静止，工件绕转台转动。
-    // 在显示上于此处断开刀路，不画旋转轨迹；下一段会以新姿态重新起笔。
-    if (A0 !== A1 || C0 !== C1) { cur = null; continue; }
-
-    // 姿态不变段：起点/终点用同一姿态变换（A0===A1 且 C0===C1）。
-    const pStart = applyAc([m.x, m.y, m.z], A0, C0);
-    const pEnd = applyAc([m.nx, m.ny, m.nz], A0, C0);
+    // 姿态分度段（A/C 变化）：转台旋转、刀具静止，在显示上断开，不画旋转轨迹。
+    if (m.a !== m.na || m.c !== m.nc) { cur = null; continue; }
+    // 坐标原样使用（已是最终加工坐标），不再做 AC 旋转变换。
     if (m.g === 0 || m.g === 1) {
-      push(pStart, m.g === 1);
-      push(pEnd, m.g === 1);
+      push([m.x, m.y, m.z], m.g === 1);
+      push([m.nx, m.ny, m.nz], m.g === 1);
     } else {
       const cx = m.x + m.i, cy = m.y + m.j;
       const r = Math.hypot(m.x - cx, m.y - cy);
       if (r < 1e-9) {
-        push(pStart, true);
-        push(pEnd, true);
+        push([m.x, m.y, m.z], true);
+        push([m.nx, m.ny, m.nz], true);
         continue;
       }
       let a0 = Math.atan2(m.y - cy, m.x - cx);
@@ -350,8 +330,7 @@ function buildToolpath(gcode) {
       for (let k = 1; k <= n; k++) {
         const t = k / n;
         const a = a0 + sweep * t;
-        // 圆弧在 XY 平面插值，z 线性；整段姿态不变，统一做 AC 变换。
-        push(applyAc([cx + r * Math.cos(a), cy + r * Math.sin(a), m.z + (m.nz - m.z) * t], A0, C0), true);
+        push([cx + r * Math.cos(a), cy + r * Math.sin(a), m.z + (m.nz - m.z) * t], true);
       }
     }
   }
@@ -761,6 +740,25 @@ export function apply(ctx, config = {}) {
   // 原始配置值；真正解析（含探测与友好报错）在 tessellateModel / generateToolpathFromModel 内按需进行。
   const freecadBin = config.freecadBin;
 
+  // ---- 插件内嵌 skill 清单（唯一数据源）----
+  // 既用于 ctx.skills.register 注册，也用于 /dsh-cam/skills 路由展示「支持哪些技能」。
+  const SKILLS = [
+    {
+      name: 'cnc-process-card',
+      title: 'CNC 工艺卡',
+      description:
+        '根据毛坯、成品模型、装夹方式与刀具清单，自动生成 CNC 加工的 MD 工艺卡（坐标系、刀具清单、工艺顺序、注意事项）。' +
+        '当用户上传毛坯/成品模型、给出装夹与刀具，要求出工艺卡、排工艺、写加工步骤时使用。',
+    },
+    {
+      name: 'cnc-auto-annotate',
+      title: 'CNC 自动标注',
+      description:
+        '根据 CNC 工艺卡，自动在 qizhouCNC_CAM 中标注成品零件的加工特征——每个面/边用什么刀具、什么坐标系。' +
+        '当用户提供工艺卡（或上一轮已生成）和成品模型，要求自动标注、标注刀具与坐标系时使用。',
+    },
+  ];
+
   log('info', 'plugin:start', {
     version: readOwnVersion(),
     freecadConfigured: typeof freecadBin === 'string' && freecadBin.trim() ? freecadBin.trim() : null,
@@ -1163,6 +1161,19 @@ export function apply(ctx, config = {}) {
         }
       },
     }));
+
+    // 插件支持的 skill 列表（供日志弹窗右侧「支持技能」面板展示）
+    routeDisposers.push(server.register({
+      kind: 'prefix',
+      path: '/dsh-cam/skills',
+      handler: async (req, res) => {
+        try {
+          send(res, { ok: true, skills: SKILLS });
+        } catch (e) {
+          send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
+        }
+      },
+    }));
   };
   ensureRoutes();
   const retry = setInterval(() => { if (routeDisposers.length === 0) ensureRoutes(); }, 100);
@@ -1277,7 +1288,138 @@ export function apply(ctx, config = {}) {
     presentCall: (args) => ({ card: 'generic', title: `Render toolpath ${args.gcode}`, kind: 'write' }),
   });
 
-  const disposers = [ctx.tools.register(camGenerate), ctx.tools.register(camLoad), ctx.tools.register(camRender)];
+  // ---- 模型几何检查：供 agent 按工艺卡自动匹配「哪类特征对应哪个面/边」 ----
+  // 返回每个面/边的可读几何摘要（类型/半径/轴线/面积/中心），不含顶点与三角面，
+  // 轻量、够 agent 做「Φ8 孔 → 半径 4 的圆柱面」这类匹配，又不灌爆上下文。
+  const camInspectModel = defineTool({
+    name: 'cam_inspect_model',
+    description:
+      'Inspect the tessellated faces and edges of a STEP/BREP/IGES model. Returns a compact ' +
+      'per-face/per-edge summary (surface type, radius, axis, area, center, shapeKey) so the ' +
+      'agent can match a process-card operation to concrete faces — e.g. a Φ8 drilled hole is ' +
+      'a Cylinder face with radius 4. Use before cam_annotate_feature to decide which face/edge ids to annotate.',
+    parameters: {
+      path: { type: 'string', required: true, description: 'Path to the model (.step/.stp/.brep/.iges), absolute or relative to the workspace root.' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          file: { type: 'string', required: true },
+          faces: { type: 'array', items: { type: 'object', additionalProperties: true }, required: true, description: 'Face summaries: { id, kind, type, radius, axis, area, center, shapeKey }.' },
+          edges: { type: 'array', items: { type: 'object', additionalProperties: true }, required: true, description: 'Edge summaries: { id, type, radius, shapeKey }.' },
+        },
+      },
+      render: (_args, value) => [
+        { type: 'text', text: `Inspected ${value.file}: ${value.faces.length} faces, ${value.edges.length} edges.` },
+      ],
+    },
+    timeoutMs: 300_000,
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      const scene = tessellateModel(args.path, { freecadBin });
+      const summarizeFace = (f) => {
+        const g = f.geometry || {};
+        const out = { id: f.id, type: g.type || 'unknown' };
+        if (g.radius !== undefined) out.radius = g.radius;
+        if (g.majorRadius !== undefined) out.majorRadius = g.majorRadius;
+        if (g.axis) out.axis = g.axis;
+        if (f.area !== undefined) out.area = f.area;
+        if (f.center) out.center = f.center;
+        if (f.shapeKey) out.shapeKey = f.shapeKey;
+        return out;
+      };
+      const summarizeEdge = (e) => {
+        const out = { id: e.id };
+        if (e.shapeKey) {
+          const m = /^circle:r([0-9.]+)$/.exec(e.shapeKey);
+          if (m) out.type = 'circle', out.radius = parseFloat(m[1]);
+          else if (/^line:/.test(e.shapeKey)) out.type = 'line';
+          else out.type = 'edge';
+        }
+        return out;
+      };
+      return {
+        file: scene.file || resolvePath(args.path),
+        faces: (scene.faces || []).map(summarizeFace),
+        edges: (scene.edges || []).map(summarizeEdge),
+      };
+    },
+    presentCall: (args) => ({ card: 'generic', title: `Inspect model ${args.path}`, kind: 'read' }),
+  });
+
+  // ---- 按工艺卡写标注：agent 把「刀具 + 坐标系 + 加工内容」写入面/边的 note ----
+  // 复用现有 feature 存储（appendFeature / updateFeature）。note 字段承载
+  // 「T#刀具 · G5#坐标系 · 加工内容」，UI 左侧标注列表直接可见。
+  const camAnnotateFeature = defineTool({
+    name: 'cam_annotate_feature',
+    description:
+      'Write a machining-position annotation (which tool, which work coordinate, what operation) ' +
+      'onto one or more faces/edges of a model. The tool/coordinate/operation text goes into the ' +
+      'annotation note, which the qizhouCNC_CAM model viewport shows next to the highlighted face. ' +
+      'Use cam_inspect_model first to find the right face/edge ids. refIds writes one annotation ' +
+      'covering several ids (e.g. four equal Φ8 holes); refId writes a single one. op=update rewrites an existing annotation by id.',
+    parameters: {
+      path: { type: 'string', required: true, description: 'Path to the model (.step/.stp/.brep/.iges).' },
+      name: { type: 'string', required: true, description: 'Short annotation name, e.g. "Φ8 定位孔" or "M6 螺纹".' },
+      kind: { type: 'string', required: true, description: '"face" or "edge".' },
+      refId: { type: 'number', description: 'Face/edge id (from cam_inspect_model) for a single annotation.' },
+      refIds: { type: 'array', items: { type: 'number' }, description: 'Face/edge ids for one batch annotation covering several features.' },
+      tool: { type: 'string', description: 'Tool spec, e.g. "T3=Φ6.9 定心钻".' },
+      coordinate: { type: 'string', description: 'Work coordinate, e.g. "G54" or "G55".' },
+      note: { type: 'string', description: 'Extra note, e.g. "钻底孔 深10".' },
+      op: { type: 'string', description: '"update" to rewrite an existing annotation, otherwise append.' },
+      id: { type: 'string', description: 'Existing annotation id (required with op=update).' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          model: { type: 'string', required: true },
+          features: { type: 'array', items: { type: 'object', additionalProperties: true }, required: true },
+        },
+      },
+      render: (_args, value) => [
+        { type: 'text', text: `Annotation written: ${value.features.length} feature(s) on the model now.` },
+      ],
+    },
+    timeoutMs: 30_000,
+    isConcurrencySafe: () => false,
+    async execute(args) {
+      const p = resolvePath(args.path);
+      const refIds = Array.isArray(args.refIds)
+        ? args.refIds.map((n) => Number(n) || 0).filter((n) => n > 0)
+        : [];
+      // note 组装：tool · coordinate · note（缺省字段不拼空段）
+      const parts = [];
+      if (args.tool) parts.push(String(args.tool).trim());
+      if (args.coordinate) parts.push(String(args.coordinate).trim());
+      if (args.note) parts.push(String(args.note).trim());
+      const combinedNote = parts.join(' · ');
+      const feature = {
+        name: String(args.name ?? '未命名'),
+        kind: args.kind === 'edge' ? 'edge' : 'face',
+        refId: refIds.length ? refIds[0] : (Number(args.refId) || 0),
+        ...(refIds.length > 1 ? { refIds } : {}),
+        note: combinedNote,
+      };
+      if (args.op === 'update' && args.id) {
+        const list = updateFeature(p, { ...feature, id: args.id });
+        return { model: p, features: list };
+      }
+      const list = appendFeature(p, feature);
+      return { model: p, features: list };
+    },
+    presentCall: (args) => ({ card: 'generic', title: `Annotate ${args.path}`, kind: 'write' }),
+  });
+
+  const disposers = [
+    ctx.tools.register(camGenerate),
+    ctx.tools.register(camLoad),
+    ctx.tools.register(camRender),
+    ctx.tools.register(camInspectModel),
+    ctx.tools.register(camAnnotateFeature),
+  ];
 
   // 斜杠命令 /dsh-qizhoucnc-cam：可带 STEP 模型附件，把「生成/查看刀路」请求注入给模型。
   // commands 是可选服务，缺失时 mountCommand 静默降级为 no-op。
@@ -1293,12 +1435,49 @@ export function apply(ctx, config = {}) {
     }
   } catch { /* 斜杠命令不可用则跳过，不影响工具本身 */ }
 
+  // ---- 内嵌 CNC 工艺 skill（cnc-process-card + cnc-auto-annotate）----
+  // 通过 ctx.skills.register 注册运行时 skill：随插件发布，任何装本插件的人都能用
+  // skill 工具调用。可选服务：无 skills 服务时静默跳过，不影响其余功能。
+  // SKILLS 常量定义在 apply 开头（唯一数据源），此处直接使用。
+  let disposeSkill = () => {};
+  try {
+    // 单个 skill 的注册：读 SKILL.md，剥 frontmatter，用 name/description 注册。
+    const registerOne = (host, skill) => {
+      if (!host || typeof host.skills?.register !== 'function') return () => {};
+      const SKILL_MD = join(__dirname, 'skills', skill.name, 'SKILL.md');
+      let content = '';
+      try { content = readFileSync(SKILL_MD, 'utf8'); } catch { content = ''; }
+      if (!content) return () => {};
+      const body = content.replace(/^\s*---[\s\S]*?---\s*/, '').trim();
+      try {
+        return host.skills.register({ name: skill.name, description: skill.description, content: body });
+      } catch (e) {
+        log('warn', 'skill:register-failed', { name: skill.name, error: e && e.message ? e.message : String(e) });
+        return () => {};
+      }
+    };
+    const registerSkills = (host) => {
+      const disposers = [];
+      for (const s of SKILLS) disposers.push(registerOne(host, s));
+      return () => { disposers.forEach((d) => { try { d(); } catch { /* ignore */ } }); };
+    };
+    if (typeof ctx.inject === 'function') {
+      ctx.inject(['skills'], (host) => {
+        disposeSkill = registerSkills(host);
+        return disposeSkill;
+      });
+    } else if (ctx.skills && typeof ctx.skills.register === 'function') {
+      disposeSkill = registerSkills(ctx);
+    }
+  } catch { /* skills 服务不可用则跳过 */ }
+
   ctx.effect(() => () => {
     clearInterval(retry);
     disposers.forEach((d) => d());
     routeDisposers.forEach((d) => d());
     routeDisposers = [];
     disposeCommand();
+    disposeSkill();
     unlistenChanges();
   });
 

@@ -2,18 +2,8 @@
 """Render G-code toolpath as a 3D tube STL, optionally merged with a model STL (ASCII or binary)."""
 import sys, math, struct
 
-# ---- 3+2 五轴（摇篮式 AC）正向运动学：A 绕 X、C 绕 Z ----
-# 与宿主 index.js 的 applyAc 保持一致（右手系）：
-# 显示坐标 = Rz(C) · Rx(A) · (x,y,z)。A=C=0 退化为恒等。
-_DEG = math.pi / 180.0
-def apply_ac(p, A, C):
-    if not A and not C:
-        return p
-    x0, y0, z0 = p
-    a = A * _DEG; ca = math.cos(a); sa = math.sin(a)
-    x1 = x0; y1 = y0 * ca - z0 * sa; z1 = y0 * sa + z0 * ca
-    c = C * _DEG; cc = math.cos(c); sc = math.sin(c)
-    return (x1 * cc - y1 * sc, x1 * sc + y1 * cc, z1)
+# 注意：FANUC 3+2 定轴程序的 X/Y/Z 已是最终加工坐标（Z=主轴进给方向），
+# 不再做 A/C 正向运动学旋转（此前错误旋转导致钻孔方向横置）。
 
 def parse_gcode(path):
     x = y = z = a = c = 0.0
@@ -44,21 +34,20 @@ def parse_gcode(path):
 def to_polyline(moves):
     pts = [(0.0, 0.0, 0.0)]
     for g, x, y, z, nx, ny, nz, i, j, a, c, na, nc in moves:
-        # 姿态分度段（A/C 变化）：转台旋转、刀具静止，不画旋转轨迹，直接断开。
+        # 姿态分度段（A/C 变化）：转台旋转、刀具静止，断开不画。
         if a != na or c != nc:
             pts.append(None)
             continue
-        # 姿态不变段：起点/终点用同一姿态（a===na 且 c===nc）。
-        p_start = apply_ac((x, y, z), a, c)
+        # 坐标原样使用（已是最终加工坐标）。
         if g in (0, 1):
-            pts.append(p_start)
-            pts.append(apply_ac((nx, ny, nz), a, c))
+            pts.append((x, y, z))
+            pts.append((nx, ny, nz))
         else:
             cx = x + i; cy = y + j
             r = math.hypot(x - cx, y - cy)
             if r < 1e-9:
-                pts.append(p_start)
-                pts.append(apply_ac((nx, ny, nz), a, c)); continue
+                pts.append((x, y, z))
+                pts.append((nx, ny, nz)); continue
             a0 = math.atan2(y - cy, x - cx)
             a1 = math.atan2(ny - cy, nx - cx)
             if g == 3:
@@ -71,7 +60,7 @@ def to_polyline(moves):
             for k in range(1, n+1):
                 t = k / n
                 aa = a0 + sweep * t
-                pts.append(apply_ac((cx + r*math.cos(aa), cy + r*math.sin(aa), z + (nz-z)*t), a, c))
+                pts.append((cx + r*math.cos(aa), cy + r*math.sin(aa), z + (nz-z)*t))
     return pts
 
 def _norm(v):

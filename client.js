@@ -155,7 +155,16 @@ window.__ModuleLoader__.load({
     function Viewer3D({ data }) {
       const [view, setView] = React.useState({ yaw: 0.7, pitch: 0.55, panX: 0, panY: 0, zoom: 1 });
       const drag = React.useRef(null);
+      const [maximized, setMaximized] = React.useState(false);
       const W = 600, H = 460, cx = W / 2, cy = H / 2;
+
+      // ESC 退出放大
+      React.useEffect(() => {
+        if (typeof window === 'undefined') return;
+        const onKey = (e) => { if (e.key === 'Escape') setMaximized(false); };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, []);
 
       const toScreen = React.useCallback((p) => {
         const [sx, sy] = project3d(p, view.yaw, view.pitch);
@@ -293,13 +302,27 @@ window.__ModuleLoader__.load({
         );
       });
 
-      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minHeight: 0 } },
+      // 放大按钮（刀路视窗放大/还原，与模型视窗同款交互）
+      const maxBtn = h('button', {
+        onClick: () => setMaximized((v) => !v),
+        title: maximized ? '还原刀路视窗大小' : '放大刀路视窗（全屏操作）',
+        style: {
+          marginLeft: 'auto', padding: '1px 8px', fontSize: 11, cursor: 'pointer', borderRadius: 5,
+          border: '1px solid ' + (maximized ? 'var(--dsw-alias-state-business-primary, #2563eb)' : 'var(--dsw-alias-border-l1, #e5e7eb)'),
+          background: maximized ? 'color-mix(in srgb, var(--dsw-alias-state-business-primary, #2563eb) 12%, transparent)' : 'transparent',
+          color: maximized ? 'var(--dsw-alias-state-business-primary, #2563eb)' : 'var(--dsw-alias-label-primary, #111)',
+          fontWeight: maximized ? 600 : 400,
+        },
+      }, maximized ? '还原' : '⛶ 放大');
+
+      const viewerInner = [
         h('div', { style: { display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' } },
           h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', marginRight: 2 } }, '视图'),
           VIEWS.map((v) => viewBtn(v, activeView === v)),
-          h('button', { style: { marginLeft: 'auto', padding: '1px 8px', fontSize: 11, cursor: 'pointer', borderRadius: 5, border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', background: 'transparent', color: 'var(--dsw-alias-label-primary, #111)' }, onClick: () => setView(fitView(0.7, 0.55)), title: '重置视图并适配' }, '重置')),
+          h('button', { style: { padding: '1px 8px', fontSize: 11, cursor: 'pointer', borderRadius: 5, border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', background: 'transparent', color: 'var(--dsw-alias-label-primary, #111)' }, onClick: () => setView(fitView(0.7, 0.55)), title: '重置视图并适配' }, '重置'),
+          maxBtn),
         h('svg', {
-          viewBox: '0 0 ' + W + ' ' + H, width: '100%', height: '100%',
+          viewBox: '0 0 ' + W + ' ' + H, width: '100%',
           style: { background: 'var(--dsw-alias-bg-base, #fff)', borderRadius: 8, border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', touchAction: 'none', cursor: 'grab', flex: 1, minHeight: 0 },
           onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp,
           onWheel, onContextMenu: (e) => e.preventDefault(),
@@ -313,6 +336,20 @@ window.__ModuleLoader__.load({
           }, '暂无刀路 — 点选下方 NC 文件自动生成')),
         h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } },
           '拖拽=旋转 · Shift+拖拽/右键=平移 · 滚轮=缩放 · ' + (data && data.file ? '文件: ' + data.file + ' · ' : '') + (data ? data.paths.length + ' 段' : '')),
+      ];
+
+      if (maximized) {
+        return h('div', {
+          style: {
+            position: 'fixed', inset: 0, zIndex: 3050, background: 'var(--dsw-alias-bg-base, #fff)',
+            padding: 16, display: 'flex', flexDirection: 'column', gap: 6,
+            boxShadow: '0 24px 80px rgba(0,0,0,0.35)',
+          },
+        }, ...viewerInner);
+      }
+
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, flex: 1, minHeight: 0 } },
+        ...viewerInner,
       );
     }
 
@@ -320,13 +357,17 @@ window.__ModuleLoader__.load({
     // scene 来自 /dsh-cam/model：{ bounds:{min,max}, faces:[{id,vertices,triangles,center,area}], edges:[{id,points}] }
     // selected: { kind:'face'|'edge', id } | null；点击面/边时回传 onSelect。
     // pivot: [x,y,z] 旋转轴心；默认取模型包围盒中心。旋转/缩放都围绕该点。
-    function ModelViewer3D({ scene, selected, selectedSet, onSelect, onAnnotate, onSelectMulti, pivot, features, locate, overlays, transform, maximized, onToggleMaximize }) {
+    function ModelViewer3D({ scene, selected, selectedSet, onSelect, onAnnotate, onSelectMulti, onConfirmMulti, pivot, features, locate, overlays, transform, maximized, onToggleMaximize }) {
       const [view, setView] = React.useState(null);
       const drag = React.useRef(null);
       // 单击/双击判定：记录上次点击的目标与时间（同目标 350ms 内再次点击 = 双击标注）
       const clickState = React.useRef({ time: 0, kind: null, id: null });
       const clickTimer = React.useRef(null);
       const svgRef = React.useRef(null);
+      // 悬停命中：与点击共用同一套几何深度拾取（hitTest），
+      // 消除「hover 高亮的面 ≠ 点击选中的面」导致的选面跳变。
+      const [hoverHit, setHoverHit] = React.useState(null);
+      const hoverThrottle = React.useRef(0);
       const W = 600, H = 460, cx = W / 2, cy = H / 2;
       // 多选集合的命中映射：kind:id -> true
       const selSetMap = React.useMemo(() => {
@@ -381,18 +422,27 @@ window.__ModuleLoader__.load({
       const fitView = React.useCallback((yaw, pitch) => {
         const bb = scene && scene.bounds;
         if (!bb) return { yaw, pitch, panX: 0, panY: 0, zoom: 1 };
-        const [x0, y0, z0] = bb.min, [x1, y1, z1] = bb.max;
-        const corners = [
-          [x0, y0, z0], [x1, y0, z0], [x0, y1, z0], [x1, y1, z0],
-          [x0, y0, z1], [x1, y0, z1], [x0, y1, z1], [x1, y1, z1],
-          [(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2],
-        ];
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        for (const p of corners) {
+        // 用所有面的顶点投影范围计算 zoom（比仅包围盒 8 角点更贴合真实形状，
+        // 对细长件/复杂件适配更准，避免模型被缩得太小或溢出）。
+        const consider = (p) => {
           const q = xf ? applyAssetTransform(p, xf) : p;
           const [sx, sy] = project3d([q[0] - tpv[0], q[1] - tpv[1], q[2] - tpv[2]], yaw, pitch);
           if (sx < minX) minX = sx; if (sx > maxX) maxX = sx;
           if (sy < minY) minY = sy; if (sy > maxY) maxY = sy;
+        };
+        const corners = [
+          [bb.min[0], bb.min[1], bb.min[2]], [bb.max[0], bb.min[1], bb.min[2]],
+          [bb.min[0], bb.max[1], bb.min[2]], [bb.max[0], bb.max[1], bb.min[2]],
+          [bb.min[0], bb.min[1], bb.max[2]], [bb.max[0], bb.min[1], bb.max[2]],
+          [bb.min[0], bb.max[1], bb.max[2]], [bb.max[0], bb.max[1], bb.max[2]],
+        ];
+        corners.forEach(consider);
+        // 补充每个面的中心点，进一步收紧适配范围
+        if (scene && Array.isArray(scene.faces)) {
+          for (const f of scene.faces) {
+            if (f.center) consider(f.center);
+          }
         }
         const w = maxX - minX, h = maxY - minY;
         const zoom = Math.min((W - 40) / Math.max(1e-6, w), (H - 40) / Math.max(1e-6, h));
@@ -401,6 +451,84 @@ window.__ModuleLoader__.load({
 
       // (re)fit when the scene changes
       React.useEffect(() => { setView(fitView(0.7, 0.55)); }, [scene, fitView]);
+
+      // 命中测试（useCallback）：几何拾取「最前面的」面/边，供 hover 与点击共用。
+      // 必须定义在早退 return 之前，保证 hook 顺序固定（否则 scene 从 null → 有值时
+      // hook 数量变化会触发 React 崩溃）。
+      const hitTest = React.useCallback((clientX, clientY) => {
+        let px = clientX, py = clientY, unit = 1;
+        const svg = svgRef.current;
+        if (svg && typeof svg.getBoundingClientRect === 'function') {
+          const r = svg.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) {
+            px = (clientX - r.left) * (W / r.width);
+            py = (clientY - r.top) * (H / r.height);
+            unit = W / r.width;
+          }
+        }
+        let best = null;
+        let bestDistSq = Infinity;
+        if (scene && Array.isArray(scene.faces)) {
+          for (const f of scene.faces) {
+            const v = f.vertices;
+            const tris = f.triangles;
+            if (!v || !tris) continue;
+            for (const tri of tris) {
+              const a = v[tri[0]], b = v[tri[1]], c = v[tri[2]];
+              if (!a || !b || !c) continue;
+              const [ax, ay] = toScreen(a), [bx, by] = toScreen(b), [cx2, cy2] = toScreen(c);
+              const bc = barycentric(px, py, ax, ay, bx, by, cx2, cy2);
+              if (!bc) continue;
+              const depth = toView(a)[2] * bc.u + toView(b)[2] * bc.v + toView(c)[2] * bc.w;
+              if (!best || best.kind !== 'face' || depth > best.depth) {
+                best = { kind: 'face', id: f.id, depth };
+              }
+            }
+          }
+        }
+        if (best) return { kind: best.kind, id: best.id };
+        const tolPx = 8 * unit;
+        let bestEdge = null;
+        if (scene && Array.isArray(scene.edges)) {
+          for (const e of scene.edges) {
+            const pts = e.points;
+            if (!pts || pts.length < 2) continue;
+            for (let i = 0; i < pts.length - 1; i++) {
+              const [ax, ay] = toScreen(pts[i]);
+              const [bx, by] = toScreen(pts[i + 1]);
+              const d2 = pointSegDistSq(px, py, ax, ay, bx, by);
+              if (d2 < bestDistSq) { bestDistSq = d2; bestEdge = e.id; }
+            }
+          }
+        }
+        if (bestEdge !== null && bestDistSq <= tolPx * tolPx) {
+          return { kind: 'edge', id: bestEdge };
+        }
+        return null;
+      }, [scene, toScreen, toView, W, H]);
+
+      // 键盘（useEffect）：ENTER = 批量标注；ESC = 清空多选。同样须在早退 return 之前。
+      React.useEffect(() => {
+        const onKey = (e) => {
+          const tag = (e.target && e.target.tagName) || '';
+          if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+          if (e.key === 'Enter') {
+            const sel = (selectedSet || []);
+            if (sel.length > 1 && typeof onConfirmMulti === 'function') {
+              e.preventDefault();
+              onConfirmMulti(sel);
+            }
+          } else if (e.key === 'Escape') {
+            if (!maximized && (selectedSet || []).length > 0 && typeof onConfirmMulti === 'function') {
+              e.preventDefault();
+              onConfirmMulti(null);
+            }
+          }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, [selectedSet, onConfirmMulti, maximized]);
+
       if (!view || !scene) return h('div', { style: { flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--dsw-alias-label-tertiary, #9ca3af)', fontSize: 13 } }, '加载模型…');
 
       const bb = scene.bounds;
@@ -474,11 +602,14 @@ window.__ModuleLoader__.load({
         const isMultiSel = !!selSetMap['face:' + f.id];
         const isFeat = featMap['face:' + f.id];
         const isLoc = !!locateIdSet['face:' + f.id];
+        // hover 高亮改用几何拾取结果（hoverHit），与点击选中的面完全一致，
+        // 消除「hover 看到的面 ≠ 点击锁定的面」的跳变。
+        const isHover = !!hoverHit && hoverHit.kind === 'face' && hoverHit.id === f.id;
         const shade = shadeOf(faceNormal(f));
         const r = Math.round(96 * shade), g = Math.round(116 * shade), b = Math.round(140 * shade);
         const baseFill = 'rgb(' + r + ',' + g + ',' + b + ')';
-        const hoverFill = 'rgb(' + Math.min(255, r + 42) + ',' + Math.min(255, g + 42) + ',' + Math.min(255, b + 42) + ')';
-        const fillColor = isLoc ? LOCATE_FILL : (isFeat ? FEAT_FILL : ((isSel || isMultiSel) ? FACE_SELECTED : baseFill));
+        // hover 灰亮高亮：用明显的蓝色半透明覆盖（而非微弱提亮），确保可见。
+        const fillColor = isLoc ? LOCATE_FILL : (isFeat ? FEAT_FILL : ((isSel || isMultiSel) ? FACE_SELECTED : (isHover ? FACE_HOVER : baseFill)));
         let d = '';
         for (const tri of f.triangles) {
           const a = f.vertices[tri[0]], b = f.vertices[tri[1]], c = f.vertices[tri[2]];
@@ -495,8 +626,6 @@ window.__ModuleLoader__.load({
           strokeWidth: isLoc ? 2.4 : (isFeat ? 0.8 : ((isSel || isMultiSel) ? 0.8 : 0.4)), strokeLinejoin: 'round',
           style: { cursor: 'pointer' },
           'data-hit': 'face', 'data-id': f.id,
-          onMouseEnter: (e) => { if (!isSel && !isMultiSel && !isFeat && !isLoc) e.currentTarget.setAttribute('fill', hoverFill); },
-          onMouseLeave: (e) => { if (!isSel && !isMultiSel && !isFeat && !isLoc) e.currentTarget.setAttribute('fill', baseFill); },
         }));
       }
       // edges as individual <polyline> for picking
@@ -506,14 +635,15 @@ window.__ModuleLoader__.load({
         const isMultiSel = !!selSetMap['edge:' + e.id];
         const isFeat = featMap['edge:' + e.id];
         const isLoc = !!locateIdSet['edge:' + e.id];
+        const isHover = !!hoverHit && hoverHit.kind === 'edge' && hoverHit.id === e.id;
         let pts = '';
         e.points.forEach((p, j) => { const [sx, sy] = toScreen(p); pts += (j === 0 ? '' : ' ') + sx.toFixed(1) + ',' + sy.toFixed(1); });
         edgeEls.push(h('polyline', {
           key: 'e' + e.id,
           points: pts,
           fill: 'none',
-          stroke: isLoc ? LOCATE_STROKE : (isFeat ? '#f97316' : ((isSel || isMultiSel) ? EDGE_SELECTED : EDGE_COLOR)),
-          strokeWidth: isLoc ? 4.4 : (isFeat ? 3.2 : ((isSel || isMultiSel) ? 3 : 1.4)),
+          stroke: isLoc ? LOCATE_STROKE : (isFeat ? '#f97316' : ((isSel || isMultiSel) ? EDGE_SELECTED : (isHover ? '#2563eb' : EDGE_COLOR))),
+          strokeWidth: isLoc ? 4.4 : (isFeat ? 3.2 : ((isSel || isMultiSel) ? 3 : (isHover ? 2.6 : 1.4))),
           strokeLinejoin: 'round', strokeLinecap: 'round',
           style: { cursor: 'pointer' },
           'data-hit': 'edge', 'data-id': e.id,
@@ -557,68 +687,19 @@ window.__ModuleLoader__.load({
         }
       }
 
-      // 命中测试：几何拾取「最前面的」面/边（不再用 DOM elementFromPoint 的绘制顺序，
-      // 那是数组顺序，会选中被画在后面的背面）。核心思想：
-      //   1) 把屏幕坐标反算回 SVG 视口坐标（考虑缩放后的 viewBox 映射与 CSS 缩放）；
-      //   2) 遍历所有面，做三角形重心坐标命中 + 视空间深度插值，取深度最大（最靠前）者；
-      //   3) 若没有命中面，再按屏幕距离最近选边（容差 ~8px）。
-      const hitTest = (clientX, clientY) => {
-        // 视口坐标：SVG 用 viewBox 0 0 600 460 + width/height 100%，需反算 CSS 缩放。
-        let px = clientX, py = clientY, unit = 1;
-        const svg = svgRef.current;
-        if (svg && typeof svg.getBoundingClientRect === 'function') {
-          const r = svg.getBoundingClientRect();
-          if (r.width > 0 && r.height > 0) {
-            px = (clientX - r.left) * (W / r.width);
-            py = (clientY - r.top) * (H / r.height);
-            unit = W / r.width; // 屏幕 px → 视口单位
-          }
-        }
-        let best = null;         // { kind, id, depth }
-        let bestDistSq = Infinity; // 边缘命中用
+      // 命中测试已上移到早退 return 之前（见上方 hitTest useCallback），
+      // 此处只保留依赖 hitTest 的普通函数（非 hook）。
 
-        // 面：三角重心坐标命中 + 深度插值（屏幕坐标 + 视空间深度同时插值）。
-        if (scene && Array.isArray(scene.faces)) {
-          for (const f of scene.faces) {
-            const v = f.vertices;
-            const tris = f.triangles;
-            if (!v || !tris) continue;
-            for (const tri of tris) {
-              const a = v[tri[0]], b = v[tri[1]], c = v[tri[2]];
-              if (!a || !b || !c) continue;
-              const [ax, ay] = toScreen(a), [bx, by] = toScreen(b), [cx2, cy2] = toScreen(c);
-              const bc = barycentric(px, py, ax, ay, bx, by, cx2, cy2);
-              if (!bc) continue;
-              // 深度：view 空间 z（越大越靠前）按重心插值
-              const depth = toView(a)[2] * bc.u + toView(b)[2] * bc.v + toView(c)[2] * bc.w;
-              if (!best || best.kind !== 'face' || depth > best.depth) {
-                best = { kind: 'face', id: f.id, depth };
-              }
-            }
-          }
-        }
-        if (best) return { kind: best.kind, id: best.id };
-
-        // 边：屏幕距离最近者（容差 8 视口单位）。
-        const tolPx = 8 * unit;
-        let bestEdge = null;
-        if (scene && Array.isArray(scene.edges)) {
-          for (const e of scene.edges) {
-            const pts = e.points;
-            if (!pts || pts.length < 2) continue;
-            for (let i = 0; i < pts.length - 1; i++) {
-              const [ax, ay] = toScreen(pts[i]);
-              const [bx, by] = toScreen(pts[i + 1]);
-              const d2 = pointSegDistSq(px, py, ax, ay, bx, by);
-              if (d2 < bestDistSq) { bestDistSq = d2; bestEdge = e.id; }
-            }
-          }
-        }
-        if (bestEdge !== null && bestDistSq <= tolPx * tolPx) {
-          return { kind: 'edge', id: bestEdge };
-        }
-        return null;
+      // hover 命中（节流）：更新 hoverHit 以驱动悬停高亮；与点击共用 hitTest。
+      const onPointerHover = (e) => {
+        if (drag.current) { setHoverHit(null); return; }
+        const now = Date.now();
+        if (now - hoverThrottle.current < 24) return; // ~40fps 节流，避免大模型下卡顿
+        hoverThrottle.current = now;
+        const hit = hitTest(e.clientX, e.clientY);
+        setHoverHit(hit);
       };
+      const onPointerLeave = () => { setHoverHit(null); };
       // 单击/双击：同一面/边 350ms 内两次点击 = 双击（标注），否则单击（选中）。
       // shiftKey=true 时走多选（Shift+点击），不做双击判定。
       const fireClick = (hit, shiftKey) => {
@@ -672,7 +753,7 @@ window.__ModuleLoader__.load({
       };
       const onPointerMove = (e) => {
         const d = drag.current;
-        if (!d) return;
+        if (!d) { onPointerHover(e); return; }
         const dx = e.clientX - d.x, dy = e.clientY - d.y;
         if (!d.moved && Math.abs(dx) + Math.abs(dy) > 3) d.moved = true;
         if (!d.moved) return;
@@ -704,8 +785,8 @@ window.__ModuleLoader__.load({
       const selCount = (selectedSet && selectedSet.length) || 0;
       const selText = selected
         ? (selected.kind === 'face' ? '已选面 #' + selected.id + (selected.area ? ' · ' + Math.round(selected.area) + ' mm²' : '') : '已选边 #' + selected.id)
-          + (selCount > 1 ? ' 等 ' + selCount + ' 个（Shift 多选）' : '') + '（双击标注）'
-        : '单击选中面或边线，双击标注加工位置 · Shift+点击多选相同特征';
+          + (selCount > 1 ? ' 等 ' + selCount + ' 个（Shift 多选，Enter 批量标注）' : '（双击标注）')
+        : '单击选中面或边线 · 双击标注 · Shift+点击多选 · Enter 批量标注';
 
       // 最大化按钮 + 恢复按钮（模型视窗放大/还原）
       const maxBtn = h('button', {
@@ -723,9 +804,10 @@ window.__ModuleLoader__.load({
       // SVG 视窗（普通内嵌或全屏遮罩共用同一份渲染逻辑）
       const svgBlock = (style) => h('svg', {
         ref: svgRef,
-        viewBox: '0 0 ' + W + ' ' + H, width: '100%', height: '100%',
+        viewBox: '0 0 ' + W + ' ' + H, width: '100%',
         style: { background: 'var(--dsw-alias-bg-base, #fff)', borderRadius: 8, border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', touchAction: 'none', cursor: 'grab', flex: 1, minHeight: 0, ...style },
         onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp,
+        onPointerLeave,
         onWheel, onContextMenu: (e) => e.preventDefault(),
       },
         gridLines.map((g, i) => line(g, 'var(--dsw-alias-border-l1, #e5e7eb)', 0.5)),
@@ -835,7 +917,7 @@ window.__ModuleLoader__.load({
       };
 
       // 把一段选中代码引用进 DSH 对话框（共享：右键菜单与兜底按钮都走这里）
-      const doQuote = (sel, startLine, endLine) => {
+      const doQuote = (sel, startLine, endLine, selStart, selEnd) => {
         const quote = '【NC 程序引用】' + (file || '') + '\n第 ' + startLine + '-' + endLine + ' 行：\n' + sel;
         const inputHub = resolveInputHub();
         if (!inputHub || typeof inputHub.shell !== 'function') {
@@ -848,6 +930,16 @@ window.__ModuleLoader__.load({
           if (typeof shell.insertQuote === 'function') ok = shell.insertQuote(quote);
           if (!ok && typeof shell.setDraft === 'function') { shell.setDraft(quote); ok = true; }
           if (!ok) setErr('引用失败：当前输入框不可编辑');
+          // 引用后把焦点与选区恢复到编辑器，避免选中高亮消失
+          if (typeof selStart === 'number' && typeof selEnd === 'number') {
+            const ta = taRef.current;
+            if (ta) {
+              try {
+                ta.focus();
+                ta.setSelectionRange(selStart, selEnd);
+              } catch (e2) { /* ignore */ }
+            }
+          }
           return ok;
         } catch (e) { setErr('引用失败：' + (e && e.message ? e.message : String(e))); return false; }
       };
@@ -863,6 +955,7 @@ window.__ModuleLoader__.load({
         if (!sel.trim()) { setErr('选中的内容为空'); setMenu(null); return; }
         setMenu({
           x: e.clientX, y: e.clientY, sel,
+          selStart: start, selEnd: end,
           startLine: ta.value.slice(0, start).split('\n').length,
           endLine: ta.value.slice(0, end).split('\n').length,
         });
@@ -1008,7 +1101,7 @@ window.__ModuleLoader__.load({
               fontSize: 13, cursor: 'pointer', border: 'none', borderRadius: 6,
               background: 'transparent', color: 'var(--dsw-alias-label-primary, #111)',
             },
-            onClick: () => { doQuote(menu.sel, menu.startLine, menu.endLine); setMenu(null); },
+            onClick: () => { doQuote(menu.sel, menu.startLine, menu.endLine, menu.selStart, menu.selEnd); setMenu(null); },
           }, '引用到对话框')) : null);
     }
 
@@ -1158,6 +1251,8 @@ window.__ModuleLoader__.load({
       const [showLog, setShowLog] = React.useState(false);
       const [logInfo, setLogInfo] = React.useState(null); // { file, size, lines, text } | null
       const [logLoading, setLogLoading] = React.useState(false);
+      // 插件支持的 skill 列表（日志弹窗右侧「支持技能」面板）
+      const [skillsList, setSkillsList] = React.useState([]); // [{ name, title, description }]
       // 版本更新检查（右下角：版本号 / 更新提醒 / 手动更新）
       const [versionInfo, setVersionInfo] = React.useState(null); // { current, latest, updateAvailable }
       const [updating, setUpdating] = React.useState(false); // 是否正在执行更新
@@ -1291,7 +1386,7 @@ window.__ModuleLoader__.load({
         post('/dsh-cam/reveal', { file: filePath }).then((d) => { if (!d.ok) setErr(d.error || '打开失败'); }).catch((e) => setErr(String(e)));
       }, [post]);
 
-      // 打开日志弹窗并拉取最近日志
+      // 打开日志弹窗并拉取最近日志 + 支持的 skill 列表
       const openLog = React.useCallback(() => {
         setShowLog(true);
         setLogLoading(true);
@@ -1300,6 +1395,11 @@ window.__ModuleLoader__.load({
           .then((d) => { setLogInfo(d && d.ok ? d : null); })
           .catch(() => setLogInfo(null))
           .finally(() => setLogLoading(false));
+        // 拉取 skill 列表（右侧「支持技能」面板）
+        fetch('/dsh-cam/skills')
+          .then((r) => r.json())
+          .then((d) => { if (d && d.ok && Array.isArray(d.skills)) setSkillsList(d.skills); })
+          .catch(() => { /* 忽略，保留旧列表 */ });
       }, []);
 
       // 清空日志（主文件；备份 .1 保留）
@@ -2040,6 +2140,24 @@ window.__ModuleLoader__.load({
                         setEditingFeatureId(null);
                         setAnnotating(true);
                       },
+                      onConfirmMulti: (sel) => {
+                        if (sel === null) {
+                          // ESC：清空多选
+                          setModelSelected(null);
+                          setModelSelectedSet([]);
+                          setAnnotating(false);
+                          return;
+                        }
+                        if (!Array.isArray(sel) || sel.length < 2) return;
+                        // ENTER：把 Shift 多选的面/边集合确认成批量标注，进入命名态
+                        setModelSelected(sel[0]);
+                        setModelSelectedSet(sel);
+                        setSimilarPrompt(null);
+                        setFeatureName('');
+                        setFeatureNote('');
+                        setEditingFeatureId(null);
+                        setAnnotating(true);
+                      },
                     }),
                     h('div', { style: { display: 'flex', gap: 6, alignItems: 'center', marginTop: 6 } },
                       h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #6b7280)' } }, '旋转轴心'),
@@ -2306,15 +2424,48 @@ window.__ModuleLoader__.load({
                       logInfo ? ('文件：' + logInfo.file + ' · ' + logInfo.lines + ' 行 · ' + formatBytes(logInfo.size)) : '')),
                   h('div', { style: { fontSize: 12, color: '#6b7280', lineHeight: '18px' } },
                     '日志记录了插件启动、FreeCAD 探测/调用、模型加载、G 代码生成等每一步的耗时与错误详情。出现问题时把日志「下载」后发给我即可快速定位。'),
+                  // 内容区：左侧日志文本 + 右侧「支持技能」列表
                   h('div', {
                     style: {
-                      flex: 1, minHeight: 200, overflow: 'auto', background: '#0f172a', color: '#cbd5e1',
-                      borderRadius: 8, padding: 10, fontSize: 11, lineHeight: '16px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-                      whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                      flex: 1, minHeight: 200, display: 'flex', flexDirection: 'row', gap: 12,
+                      overflow: 'hidden',
                     },
                   },
-                    logLoading ? '加载日志中…'
-                      : (logInfo && logInfo.text ? logInfo.text : '暂无日志（还没触发过相关操作）')),
+                    h('div', {
+                      style: {
+                        flex: 1, minWidth: 0, overflow: 'auto', background: '#0f172a', color: '#cbd5e1',
+                        borderRadius: 8, padding: 10, fontSize: 11, lineHeight: '16px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                        whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                      },
+                    },
+                      logLoading ? '加载日志中…'
+                        : (logInfo && logInfo.text ? logInfo.text : '暂无日志（还没触发过相关操作）')),
+                    h('div', {
+                      style: {
+                        width: 240, flexShrink: 0, overflowY: 'auto', borderRadius: 8,
+                        background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)',
+                        border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', padding: 10,
+                        display: 'flex', flexDirection: 'column', gap: 8,
+                      },
+                    },
+                      h('div', { style: { fontSize: 12, fontWeight: 700, color: 'var(--dsw-alias-label-primary, #111)' } }, '支持技能'),
+                      skillsList.length > 0
+                        ? skillsList.map((s) => h('div', {
+                            key: s.name,
+                            style: {
+                              display: 'flex', flexDirection: 'column', gap: 4, padding: '8px 9px',
+                              borderRadius: 8, background: 'var(--dsw-alias-bg-base, #fff)',
+                              border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)',
+                            },
+                          },
+                            h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                              h('span', { style: { fontSize: 12, fontWeight: 700, color: 'var(--dsw-alias-state-business-primary, #2563eb)' } }, s.title || s.name),
+                              h('span', {
+                                style: { fontSize: 10, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', fontFamily: 'ui-monospace, Menlo, Consolas, monospace' },
+                              }, s.name)),
+                            h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #6b7280)', lineHeight: '15px' } }, s.description)))
+                        : h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } }, '加载中…')),
+                    ),
                   h('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
                     h('button', { onClick: clearLog, style: { ...btn, fontSize: 12, padding: '4px 12px' } }, '清空'),
                     h('button', { onClick: downloadLog, style: { ...btn, fontSize: 12, padding: '4px 12px' } }, '下载 .log'),

@@ -128,6 +128,37 @@ def _edge_shape_key(e):
         return None
 
 
+def _face_geometry(f):
+    """Compact geometry metadata for agent-side matching (type / radius / axis).
+
+    Emitted alongside each face so an agent (via cam_inspect_model) can match
+    a process-card operation to concrete faces: a drilled hole is a cylindrical
+    face whose radius equals the hole radius; a milled pocket is a planar face
+    with matching area; a thread is a cylindrical face at the minor diameter.
+    """
+    s = f.Surface
+    t = type(s).__name__
+    geom = {"type": t}
+    try:
+        if t == 'Cylinder':
+            geom["radius"] = _r(s.Radius, 4)
+            geom["axis"] = list(_axis(f))
+        elif t == 'Cone':
+            geom["radius"] = _r(s.Radius, 4)
+            geom["axis"] = list(_axis(f))
+            geom["semiAngle"] = _r(s.SemiAngle, 4)
+        elif t == 'Sphere':
+            geom["radius"] = _r(s.Radius, 4)
+        elif t == 'Toroid':
+            geom["radius"] = _r(s.MinorRadius, 4)
+            geom["majorRadius"] = _r(s.MajorRadius, 4)
+            geom["axis"] = list(_axis(f))
+        # Plane: nothing extra — area/perimeter already carried on the face.
+    except Exception:
+        pass
+    return geom
+
+
 def _discretize_full_circle(curve, tol):
     """Discretize a full circle curve as one closed loop (first == last)."""
     try:
@@ -175,6 +206,7 @@ def run(model_path, out_path, tol=0.1):
             "center": center,
             "area": round(area, 3),
             "shapeKey": _face_shape_key(f),
+            "geometry": _face_geometry(f),
         }))
 
     # ---- 2) merge identical periodic faces (split cylinder/cone/sphere/torus) ----
@@ -206,6 +238,7 @@ def run(model_path, out_path, tol=0.1):
         total_area = 0.0
         wcenter = [0.0, 0.0, 0.0]
         shape_key = group[0].get("shapeKey")
+        geom = group[0].get("geometry")
         for g in group:
             off = len(vertices)
             vertices.extend(g["vertices"])
@@ -227,6 +260,7 @@ def run(model_path, out_path, tol=0.1):
             "center": wcenter,
             "area": round(total_area, 3),
             "shapeKey": shape_key,
+            "geometry": geom,
         })
         fid += 1
 
