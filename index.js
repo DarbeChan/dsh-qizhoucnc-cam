@@ -759,6 +759,15 @@ export function apply(ctx, config = {}) {
     },
   ];
 
+  // 读取某个 skill 的 SKILL.md 正文（剥 frontmatter）。注册与路由共用。
+  const readSkillBody = (name) => {
+    const SKILL_MD = join(__dirname, 'skills', name, 'SKILL.md');
+    let content = '';
+    try { content = readFileSync(SKILL_MD, 'utf8'); } catch { content = ''; }
+    if (!content) return '';
+    return content.replace(/^\s*---[\s\S]*?---\s*/, '').trim();
+  };
+
   log('info', 'plugin:start', {
     version: readOwnVersion(),
     freecadConfigured: typeof freecadBin === 'string' && freecadBin.trim() ? freecadBin.trim() : null,
@@ -1162,12 +1171,21 @@ export function apply(ctx, config = {}) {
       },
     }));
 
-    // 插件支持的 skill 列表（供日志弹窗右侧「支持技能」面板展示）
+    // 插件支持的 skill 列表（供主界面「支持技能」弹窗展示 + 详情查看）
     routeDisposers.push(server.register({
       kind: 'prefix',
       path: '/dsh-cam/skills',
       handler: async (req, res) => {
         try {
+          const url = new URL(req.url ?? '/', 'http://localhost');
+          const name = url.searchParams.get('name');
+          if (name) {
+            // 单个 skill 详情：返回正文（方法内容），供弹窗查看/引用
+            const skill = SKILLS.find((s) => s.name === name);
+            if (!skill) { send(res, { ok: false, error: 'skill not found: ' + name }, 404); return; }
+            send(res, { ok: true, skill: { ...skill, content: readSkillBody(name) } });
+            return;
+          }
           send(res, { ok: true, skills: SKILLS });
         } catch (e) {
           send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
@@ -1444,11 +1462,8 @@ export function apply(ctx, config = {}) {
     // 单个 skill 的注册：读 SKILL.md，剥 frontmatter，用 name/description 注册。
     const registerOne = (host, skill) => {
       if (!host || typeof host.skills?.register !== 'function') return () => {};
-      const SKILL_MD = join(__dirname, 'skills', skill.name, 'SKILL.md');
-      let content = '';
-      try { content = readFileSync(SKILL_MD, 'utf8'); } catch { content = ''; }
-      if (!content) return () => {};
-      const body = content.replace(/^\s*---[\s\S]*?---\s*/, '').trim();
+      const body = readSkillBody(skill.name);
+      if (!body) return () => {};
       try {
         return host.skills.register({ name: skill.name, description: skill.description, content: body });
       } catch (e) {

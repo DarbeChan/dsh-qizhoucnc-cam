@@ -410,6 +410,13 @@ window.__ModuleLoader__.load({
         return [cx + sx * view.zoom + view.panX, cy + sy * view.zoom + view.panY];
       }, [view, tpv[0], tpv[1], tpv[2], xf]);
 
+      // 不应用主体 transform（xf）的投影：用于坐标轴/网格，让「加工坐标系」保持固定方向，
+      // 只随视窗 yaw/pitch 旋转，不随工件的位移/旋转（transform）而转动。
+      const toScreenNoXf = React.useCallback((p) => {
+        const [sx, sy] = project3d([p[0] - tpv[0], p[1] - tpv[1], p[2] - tpv[2]], view.yaw, view.pitch);
+        return [cx + sx * view.zoom + view.panX, cy + sy * view.zoom + view.panY];
+      }, [view, tpv[0], tpv[1], tpv[2]]);
+
       // 视空间：返回 [screenX, screenY, depth]。depth 沿视线（越大 = 越靠前/越靠近视点）。
       // 用于「最前面」几何拾取：命中多个面时取 depth 最大的那个。
       const toView = React.useCallback((p) => {
@@ -539,6 +546,12 @@ window.__ModuleLoader__.load({
       const line = (pts, color, width, dash) => {
         let d = '';
         pts.forEach((p, j) => { const [sx, sy] = toScreen(p); d += (j === 0 ? 'M' : 'L') + sx.toFixed(1) + ' ' + sy.toFixed(1); });
+        return h('path', { d, fill: 'none', stroke: color, strokeWidth: width, strokeDasharray: dash, strokeLinejoin: 'round', strokeLinecap: 'round' });
+      };
+      // 不应用主体 transform 的线（坐标轴/网格用，保持加工坐标系固定方向）
+      const lineNoXf = (pts, color, width, dash) => {
+        let d = '';
+        pts.forEach((p, j) => { const [sx, sy] = toScreenNoXf(p); d += (j === 0 ? 'M' : 'L') + sx.toFixed(1) + ' ' + sy.toFixed(1); });
         return h('path', { d, fill: 'none', stroke: color, strokeWidth: width, strokeDasharray: dash, strokeLinejoin: 'round', strokeLinecap: 'round' });
       };
 
@@ -810,8 +823,8 @@ window.__ModuleLoader__.load({
         onPointerLeave,
         onWheel, onContextMenu: (e) => e.preventDefault(),
       },
-        gridLines.map((g, i) => line(g, 'var(--dsw-alias-border-l1, #e5e7eb)', 0.5)),
-        axes.map((a, i) => line(a.pts, a.color, 1.2)),
+        gridLines.map((g, i) => lineNoXf(g, 'var(--dsw-alias-border-l1, #e5e7eb)', 0.5)),
+        axes.map((a, i) => lineNoXf(a.pts, a.color, 1.2)),
         h('g', null, faceEls),
         h('g', null, edgeEls),
         h('g', null, overlayEls));
@@ -1251,8 +1264,11 @@ window.__ModuleLoader__.load({
       const [showLog, setShowLog] = React.useState(false);
       const [logInfo, setLogInfo] = React.useState(null); // { file, size, lines, text } | null
       const [logLoading, setLogLoading] = React.useState(false);
-      // 插件支持的 skill 列表（日志弹窗右侧「支持技能」面板）
+      // 插件支持的 skill 列表（主界面「支持技能」弹窗展示）
       const [skillsList, setSkillsList] = React.useState([]); // [{ name, title, description }]
+      // 支持技能弹窗：开关 + 当前查看详情的 skill（含 content 正文）
+      const [showSkills, setShowSkills] = React.useState(false);
+      const [skillDetail, setSkillDetail] = React.useState(null); // { name, title, description, content } | null
       // 版本更新检查（右下角：版本号 / 更新提醒 / 手动更新）
       const [versionInfo, setVersionInfo] = React.useState(null); // { current, latest, updateAvailable }
       const [updating, setUpdating] = React.useState(false); // 是否正在执行更新
@@ -1366,7 +1382,7 @@ window.__ModuleLoader__.load({
         return () => clearInterval(t);
       }, [loadChangedNc]);
 
-      // ESC 关闭全屏/弹窗：模型视窗放大 → 二维码放大 → 打赏弹窗 → 日志弹窗，按优先级逐层退出。
+      // ESC 关闭全屏/弹窗：模型视窗放大 → 二维码放大 → 打赏弹窗 → 日志弹窗 → 技能弹窗，按优先级逐层退出。
       React.useEffect(() => {
         if (typeof window === 'undefined') return;
         const onKey = (e) => {
@@ -1375,10 +1391,11 @@ window.__ModuleLoader__.load({
           if (rewardZoomed) { setRewardZoomed(false); return; }
           if (showReward) { setShowReward(false); return; }
           if (showLog) { setShowLog(false); return; }
+          if (showSkills) { setShowSkills(false); setSkillDetail(null); return; }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-      }, [modelMaximized, rewardZoomed, showReward, showLog]);
+      }, [modelMaximized, rewardZoomed, showReward, showLog, showSkills]);
 
       const post = React.useCallback((path, body) => fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).then((r) => r.json()), []);
 
@@ -1386,7 +1403,7 @@ window.__ModuleLoader__.load({
         post('/dsh-cam/reveal', { file: filePath }).then((d) => { if (!d.ok) setErr(d.error || '打开失败'); }).catch((e) => setErr(String(e)));
       }, [post]);
 
-      // 打开日志弹窗并拉取最近日志 + 支持的 skill 列表
+      // 打开日志弹窗并拉取最近日志（技能列表由 loadSkills 挂载时已拉取）
       const openLog = React.useCallback(() => {
         setShowLog(true);
         setLogLoading(true);
@@ -1395,11 +1412,6 @@ window.__ModuleLoader__.load({
           .then((d) => { setLogInfo(d && d.ok ? d : null); })
           .catch(() => setLogInfo(null))
           .finally(() => setLogLoading(false));
-        // 拉取 skill 列表（右侧「支持技能」面板）
-        fetch('/dsh-cam/skills')
-          .then((r) => r.json())
-          .then((d) => { if (d && d.ok && Array.isArray(d.skills)) setSkillsList(d.skills); })
-          .catch(() => { /* 忽略，保留旧列表 */ });
       }, []);
 
       // 清空日志（主文件；备份 .1 保留）
@@ -1573,6 +1585,73 @@ window.__ModuleLoader__.load({
           .catch(() => {});
       }, []);
       React.useEffect(() => { checkVersion(); }, [checkVersion]);
+
+      // 拉取插件支持的 skill 列表（主界面 footer「支持技能」）
+      // 后端路由不可用（未重启）时回退到静态列表，避免一直显示「…」。
+      const FALLBACK_SKILLS = [
+        { name: 'cnc-process-card', title: 'CNC 工艺卡', description: '生成 CNC 加工 MD 工艺卡' },
+        { name: 'cnc-auto-annotate', title: 'CNC 自动标注', description: '按工艺卡自动标注刀具/坐标系' },
+      ];
+      const loadSkills = React.useCallback(() => {
+        fetch('/dsh-cam/skills')
+          .then((r) => r.json())
+          .then((d) => { if (d && d.ok && Array.isArray(d.skills) && d.skills.length) setSkillsList(d.skills); else setSkillsList(FALLBACK_SKILLS); })
+          .catch(() => setSkillsList(FALLBACK_SKILLS));
+      }, []);
+      React.useEffect(() => { loadSkills(); }, [loadSkills]);
+
+      // 打开「支持技能」弹窗（列表）
+      const openSkills = React.useCallback(() => {
+        setShowSkills(true);
+        setSkillDetail(null);
+        loadSkills();
+      }, [loadSkills]);
+
+      // 查看单个 skill 的完整方法详情（弹窗内展开正文）
+      const viewSkillDetail = React.useCallback((name) => {
+        fetch('/dsh-cam/skills?name=' + encodeURIComponent(name))
+          .then((r) => r.json())
+          .then((d) => {
+            if (d && d.ok && d.skill) setSkillDetail(d.skill);
+            else {
+              // 路由不可用（未重启）：用列表里的描述兜底
+              const fallback = FALLBACK_SKILLS.find((s) => s.name === name);
+              if (fallback) setSkillDetail({ ...fallback, content: '（完整方法内容需重启后加载）\n\n' + fallback.description });
+            }
+          })
+          .catch(() => {
+            const fallback = FALLBACK_SKILLS.find((s) => s.name === name);
+            if (fallback) setSkillDetail({ ...fallback, content: '（完整方法内容需重启后加载）\n\n' + fallback.description });
+          });
+      }, []);
+
+      // 把当前查看的技能方法引用到对话框（复用 NcEditor 同款 inputHub 解析逻辑）
+      const quoteSkill = React.useCallback(() => {
+        if (!skillDetail) return;
+        const quote = '【技能引用】' + (skillDetail.title || skillDetail.name) + '（调用名：' + skillDetail.name + '）\n\n' + (skillDetail.content || skillDetail.description || '');
+        let inputHub = null;
+        if (appCtx) {
+          try { const conv = appCtx.get('conversation'); if (conv && conv.input && typeof conv.input.shell === 'function') inputHub = conv.input; } catch (e) {}
+          if (!inputHub) {
+            try {
+              const sessions = appCtx.get('sessions');
+              if (sessions && typeof sessions.scope === 'function' && sessionId) {
+                const actx = sessions.scope(sessionId);
+                if (actx) { const conv = actx.get('conversation'); if (conv && conv.input && typeof conv.input.shell === 'function') inputHub = conv.input; }
+              }
+            } catch (e) {}
+          }
+        }
+        if (!inputHub || typeof inputHub.shell !== 'function') { setErr('对话框服务未就绪，无法引用'); return; }
+        try {
+          const shell = inputHub.shell(sessionId);
+          if (!shell) { setErr('未能定位到当前会话的输入框'); return; }
+          let ok = false;
+          if (typeof shell.insertQuote === 'function') ok = shell.insertQuote(quote);
+          if (!ok && typeof shell.setDraft === 'function') { shell.setDraft(quote); ok = true; }
+          if (!ok) setErr('引用失败：当前输入框不可编辑');
+        } catch (e) { setErr('引用失败：' + (e && e.message ? e.message : String(e))); }
+      }, [skillDetail, sessionId]);
 
       // 点击「更新」：通过 dshmarket 的公共更新 API 触发更新（同源、带浏览器会话 cookie）
       const doUpdate = React.useCallback(() => {
@@ -2318,6 +2397,16 @@ window.__ModuleLoader__.load({
                 cursor: 'pointer',
               },
             }, '📋 日志'),
+            // 支持技能：入口按钮，点击弹出技能列表弹窗（含详情与引用）
+            h('button', {
+              onClick: openSkills,
+              title: '查看本插件支持的技能（点击查看完整方法与引用）',
+              style: {
+                ...btn, fontSize: 11, padding: '3px 10px', border: 'none',
+                background: 'transparent', color: 'var(--dsw-alias-label-tertiary, #9ca3af)',
+                cursor: 'pointer',
+              },
+            }, '🧩 支持技能'),
             // 右下角：版本号（无更新时）或 更新提醒 + 手动更新按钮
             h('span', { style: { flex: 1 } }),
             versionInfo && versionInfo.updateAvailable
@@ -2424,52 +2513,92 @@ window.__ModuleLoader__.load({
                       logInfo ? ('文件：' + logInfo.file + ' · ' + logInfo.lines + ' 行 · ' + formatBytes(logInfo.size)) : '')),
                   h('div', { style: { fontSize: 12, color: '#6b7280', lineHeight: '18px' } },
                     '日志记录了插件启动、FreeCAD 探测/调用、模型加载、G 代码生成等每一步的耗时与错误详情。出现问题时把日志「下载」后发给我即可快速定位。'),
-                  // 内容区：左侧日志文本 + 右侧「支持技能」列表
                   h('div', {
                     style: {
-                      flex: 1, minHeight: 200, display: 'flex', flexDirection: 'row', gap: 12,
-                      overflow: 'hidden',
+                      flex: 1, minHeight: 200, overflow: 'auto', background: '#0f172a', color: '#cbd5e1',
+                      borderRadius: 8, padding: 10, fontSize: 11, lineHeight: '16px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                      whiteSpace: 'pre-wrap', wordBreak: 'break-all',
                     },
                   },
-                    h('div', {
-                      style: {
-                        flex: 1, minWidth: 0, overflow: 'auto', background: '#0f172a', color: '#cbd5e1',
-                        borderRadius: 8, padding: 10, fontSize: 11, lineHeight: '16px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-                        whiteSpace: 'pre-wrap', wordBreak: 'break-all',
-                      },
-                    },
-                      logLoading ? '加载日志中…'
-                        : (logInfo && logInfo.text ? logInfo.text : '暂无日志（还没触发过相关操作）')),
-                    h('div', {
-                      style: {
-                        width: 240, flexShrink: 0, overflowY: 'auto', borderRadius: 8,
-                        background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)',
-                        border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', padding: 10,
-                        display: 'flex', flexDirection: 'column', gap: 8,
-                      },
-                    },
-                      h('div', { style: { fontSize: 12, fontWeight: 700, color: 'var(--dsw-alias-label-primary, #111)' } }, '支持技能'),
-                      skillsList.length > 0
-                        ? skillsList.map((s) => h('div', {
-                            key: s.name,
-                            style: {
-                              display: 'flex', flexDirection: 'column', gap: 4, padding: '8px 9px',
-                              borderRadius: 8, background: 'var(--dsw-alias-bg-base, #fff)',
-                              border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)',
-                            },
-                          },
-                            h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
-                              h('span', { style: { fontSize: 12, fontWeight: 700, color: 'var(--dsw-alias-state-business-primary, #2563eb)' } }, s.title || s.name),
-                              h('span', {
-                                style: { fontSize: 10, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', fontFamily: 'ui-monospace, Menlo, Consolas, monospace' },
-                              }, s.name)),
-                            h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #6b7280)', lineHeight: '15px' } }, s.description)))
-                        : h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } }, '加载中…')),
-                    ),
+                    logLoading ? '加载日志中…'
+                      : (logInfo && logInfo.text ? logInfo.text : '暂无日志（还没触发过相关操作）')),
                   h('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
                     h('button', { onClick: clearLog, style: { ...btn, fontSize: 12, padding: '4px 12px' } }, '清空'),
                     h('button', { onClick: downloadLog, style: { ...btn, fontSize: 12, padding: '4px 12px' } }, '下载 .log'),
                     h('button', { onClick: () => setShowLog(false), style: { ...btnPrimary, fontSize: 12, padding: '4px 16px' } }, '关闭'))))
+            : null,
+          // 支持技能弹窗：列表 + 详情（完整方法内容 + 引用到对话框）
+          showSkills
+            ? h('div', {
+                style: {
+                  position: 'fixed', inset: 0, zIndex: 3400,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  background: 'rgba(15, 23, 42, 0.55)',
+                },
+                onClick: () => { setShowSkills(false); setSkillDetail(null); },
+              },
+                h('div', {
+                  style: {
+                    background: 'var(--dsw-alias-bg-base, #fff)', borderRadius: 14, padding: 16,
+                    boxShadow: '0 24px 80px rgba(0,0,0,0.35)', display: 'flex', flexDirection: 'column', gap: 10,
+                    width: 'min(760px, 92vw)', maxHeight: '82vh',
+                  },
+                  onClick: (e) => e.stopPropagation(),
+                },
+                  h('div', { style: { fontSize: 15, fontWeight: 700, color: '#1f2937', display: 'flex', alignItems: 'center', gap: 8 } },
+                    '支持技能',
+                    h('span', { style: { fontSize: 11, fontWeight: 400, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } },
+                      '本插件内嵌的 CNC 加工技能，点击查看完整方法，可直接引用到对话')),
+                  skillDetail
+                    // 详情态：展示单个 skill 的完整方法 + 引用按钮
+                    ? h(React.Fragment, null,
+                        h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+                          h('button', {
+                            onClick: () => setSkillDetail(null),
+                            style: { ...btn, fontSize: 12, padding: '3px 10px' },
+                          }, '← 返回列表'),
+                          h('span', { style: { flex: 1 } }),
+                          h('button', {
+                            onClick: quoteSkill,
+                            style: { ...btnPrimary, fontSize: 12, padding: '3px 12px' },
+                            title: '把该技能的完整方法引用到对话框',
+                          }, '引用到对话框')),
+                        h('div', { style: { fontSize: 14, fontWeight: 700, color: 'var(--dsw-alias-label-primary, #111)' } },
+                          skillDetail.title || skillDetail.name),
+                        h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', fontFamily: 'ui-monospace, Menlo, Consolas, monospace' } },
+                          '调用名：' + skillDetail.name),
+                        h('div', {
+                          style: {
+                            flex: 1, minHeight: 0, overflow: 'auto', background: 'var(--dsw-alias-bg-layer-1, #fff)',
+                            border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', borderRadius: 8, padding: 12,
+                            fontSize: 12.5, lineHeight: '1.7', color: 'var(--dsw-alias-label-primary, #111)',
+                            whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                          },
+                        }, skillDetail.content || skillDetail.description || '（无内容）'))
+                    // 列表态：列出所有技能（可滚动，支持大量技能）
+                    : h('div', {
+                        style: {
+                          flex: 1, minHeight: 200, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 8,
+                        },
+                      },
+                        skillsList.length > 0
+                          ? skillsList.map((s) => h('div', {
+                              key: s.name,
+                              onClick: () => viewSkillDetail(s.name),
+                              title: '点击查看完整方法',
+                              style: {
+                                display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px',
+                                borderRadius: 8, background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)',
+                                border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', cursor: 'pointer',
+                              },
+                            },
+                              h('span', { style: { fontSize: 13, fontWeight: 700, color: 'var(--dsw-alias-state-business-primary, #2563eb)', whiteSpace: 'nowrap' } }, s.title || s.name),
+                              h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', fontFamily: 'ui-monospace, Menlo, Consolas, monospace', whiteSpace: 'nowrap' } }, s.name),
+                              h('span', { style: { flex: 1, fontSize: 11.5, color: 'var(--dsw-alias-label-secondary, #6b7280)', lineHeight: '16px', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' } }, s.description),
+                              h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', whiteSpace: 'nowrap' } }, '查看 →')))
+                          : h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', textAlign: 'center', padding: '20px 0' } }, '加载技能列表…')),
+                  h('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
+                    h('button', { onClick: () => { setShowSkills(false); setSkillDetail(null); }, style: { ...btnPrimary, fontSize: 12, padding: '4px 16px' } }, '关闭'))))
             : null,
         )));
     }
