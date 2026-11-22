@@ -2,6 +2,23 @@
 
 本文件记录 DSH-QizhouCNC_CAM 的各版本变更。
 
+## [1.3.37] - 2026-11-22
+
+### 新增 (Added)
+
+- **内置 8 个 CNC 加工技能**：把技能库 `/Volumes/CDB_FORU/CNC-Skills/` 下的全部技能并入插件 `skills/` 目录并注册进技能系统：
+  - `cnc-skill-authoring` CNC 技能创建规范（元技能）
+  - `cnc-fanuc-post` FANUC 后处理骨架（换刀/回零/A·C 姿态/坐标系）
+  - `cnc-raster-mill` 往复式层切铣削
+  - `cnc-peck-drill` G73 啄钻 / G81 钻孔
+  - `cnc-helical-bore` 螺旋铣孔（扩孔）
+  - `cnc-thread-mill` 螺纹铣削（多刀径向切入）
+  - `cnc-ellipse-comp` 失圆补偿（椭圆逼近）
+  - `cnc-step-reverse` STEP 模型几何逆向
+- 至此插件内嵌技能共 11 个（原有 cnc-process-card / cnc-auto-annotate / cnc-stock-diff + 上述 8 个），每个都自动附「工具调用规范」。
+
+---
+
 ## [1.3.36] - 2026-11-22
 
 ### 新增 (Added)
