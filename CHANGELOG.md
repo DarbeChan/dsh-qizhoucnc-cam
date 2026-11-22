@@ -2,6 +2,19 @@
 
 本文件记录 DSH-QizhouCNC_CAM 的各版本变更。
 
+## [1.3.36] - 2026-11-22
+
+### 新增 (Added)
+
+- **导入技能**：「支持技能」弹窗新增「＋ 导入技能」入口，支持上传 SKILL.md 文件或直接粘贴内容，把提炼的成功方法导入为可调用技能。导入后自动告知技能名称（调用名）与用途；导入的技能带「导入」标记、可单独删除。导入的技能持久化到 `~/.dsh/storages/dsh-cam-skills/`，与内嵌技能一起注册进 skill 服务并出现在技能列表。
+- **工具调用规范**：每个技能（内嵌 + 导入）的正文末尾自动附上「工具调用规范」——列出 qizhouCNC_CAM 已制作好的全部工具（cam_generate_gcode / cam_load_toolpath / cam_render_toolpath / cam_inspect_model / cam_annotate_feature / cam_get_model_pose / cam_stock_difference）的用途、参数签名与返回，保证导入的自写技能也能按规范正确调用工具。
+
+### 修复 (Fixed)
+
+- **编辑 NC 显示行号**：NC 编辑界面文本区左侧新增行号栏（1..N），随滚动/换行与文本行一一对齐，方便定位程序行。
+
+---
+
 ## [1.3.35] - 2026-11-22
 
 ### 新增 (Added)

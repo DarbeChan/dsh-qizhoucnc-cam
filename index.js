@@ -25,6 +25,60 @@ const MODEL_SCRIPT = join(__dirname, 'model_tessellate.py');
 const DIFF_SCRIPT = join(__dirname, 'stock_diff.py');
 const STATE_FILE = join(homedir(), '.dsh', 'storages', 'dsh-cam-toolpath.json');
 const WORKSPACE_STORE = join(homedir(), '.dsh', 'storages', 'workspace.json');
+// 用户导入的技能目录：每个技能一个子目录，内含 SKILL.md（frontmatter 含 name/title/description）。
+const IMPORTED_SKILLS_DIR = join(homedir(), '.dsh', 'storages', 'dsh-cam-skills');
+// 技能调用名规范：小写字母/数字/连字符（与 skill 服务的 SKILL_NAME 约束一致）。
+const SKILL_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+// ---- 工具调用规范（随每个技能一起下发给 agent）----
+// 每个 skill 本质是「如何调用已制作好的 cam_* 工具」的方法说明；这里统一附上工具签名与
+// 参数规范，保证导入的（用户自写）技能也能正确调用插件工具。
+const TOOL_REFERENCE = [
+  '## 工具调用规范（qizhouCNC_CAM）',
+  '',
+  '本插件已制作好以下工具，技能内容请严格按签名调用（参数名/类型一致）：',
+  '',
+  '### cam_generate_gcode',
+  '- 用途：用 FreeCAD CAM 从 STEP/BREP/IGES 模型生成 G 代码刀路（外轮廓，取最大平面）。',
+  '- 参数：`path`(必填，模型路径) · `stepDown`(每刀深度 mm，默认 2) · `finalDepth`(最终深度 mm，默认 6) · `post`(后处理器名，默认 grbl)。',
+  '- 返回：`gcode`(文本) · `file`(.nc 路径) · `lines` · `segments`。',
+  '',
+  '### cam_load_toolpath',
+  '- 用途：把已有 .nc/.ngc/.gcode 文件解析进刀路视窗（不重新生成）。',
+  '- 参数：`file`(必填，G 代码路径)。',
+  '',
+  '### cam_render_toolpath',
+  '- 用途：把 .nc 刀路渲染成 3D 管状 STL，可合入模型 STL 一起用 cad_view 查看。',
+  '- 参数：`gcode`(必填，.nc 路径) · `model`(可选，模型 STL) · `radius`(管径 mm，默认 2)。',
+  '',
+  '### cam_inspect_model',
+  '- 用途：读取 STEP/BREP/IGES 模型的面/边几何摘要（类型/半径/轴线/面积/中心/shapeKey），供匹配「Φ8 孔=半径 4 圆柱面」。',
+  '- 参数：`path`(必填，模型路径)。',
+  '- 返回：`faces`(每个含 id/type/radius/axis/area/center/shapeKey) · `edges`。',
+  '',
+  '### cam_annotate_feature',
+  '- 用途：把「刀具/坐标系/加工内容」写到一个或多个面/边的标注 note 上（模型视窗高亮显示）。',
+  '- 参数：`path`(必填) · `name`(必填，如「Φ8 定位孔」) · `kind`(必填，`face`|`edge`) · `refId`(单个 id) 或 `refIds`(批量 id 数组) · `tool`(如「T3=Φ6.9 定心钻」) · `coordinate`(如「G54」) · `note`(补充) · `op`(`update` 需配 `id`)。',
+  '',
+  '### cam_get_model_pose',
+  '- 用途：读取成品模型当前工件坐标位置参数（用户在视窗「应用到位」保存的位移/旋转）。',
+  '- 参数：`path`(必填)。返回 `transform`(translate/rotate) 或 null。',
+  '',
+  '### cam_stock_difference',
+  '- 用途：布尔差「毛坯 − 成品」计算待去除材料体积/包围盒/面边数。',
+  '- 参数：`stock`(必填，毛坯路径) · `part`(必填，成品路径)。',
+  '',
+  '### 通用规范',
+  '- 路径用绝对路径，或相对当前工作区根；先用 `cam_inspect_model` 拿真实 id，不要编造。',
+  '- 直径换半径：`半径 = 直径 ÷ 2`；螺纹按底孔直径算半径。',
+  '- 同尺寸多特征用 `refIds` 一次批量标注，避免重复调用。',
+].join('\n');
+
+// 把工具规范附加到技能正文末尾（注册与详情展示都走这里，保证 agent 拿到工具签名）。
+function withToolRef(body) {
+  const b = String(body || '').trim();
+  return b ? b + '\n\n' + TOOL_REFERENCE : TOOL_REFERENCE;
+}
 
 // ---- 诊断日志（持久化到磁盘，便于"导出日志"定位问题） ----
 // 每次调用写一行 JSON，滚动保留最近约 1MB（超过则备份为 .1 再重开）。写入失败静默忽略，绝不影响主流程。
@@ -869,6 +923,94 @@ export function apply(ctx, config = {}) {
     return content.replace(/^\s*---[\s\S]*?---\s*/, '').trim();
   };
 
+  // ---- 导入技能（用户上传 SKILL.md 提炼的成功方法）----
+  // 持久化到 ~/.dsh/storages/dsh-cam-skills/<name>/SKILL.md，并在 /dsh-cam/skills 列表里合并展示，
+  // 同时注册进 skill 服务（与内嵌技能同机制）。frontmatter 需含 name/title/description。
+  // 返回 { skill } 或抛错（名称非法/缺失 frontmatter 等）。
+  function parseSkillMarkdown(md) {
+    const text = String(md || '').trim();
+    if (!text) throw new Error('SKILL.md 内容为空');
+    const m = /^\s*---\s*\n([\s\S]*?)\n---\s*\n?/.exec(text);
+    if (!m) throw new Error('缺少 YAML frontmatter（--- 开头，含 name/description）');
+    const fm = m[1];
+    const get = (key) => {
+      const re = new RegExp('^' + key + ':\\s*(.+)$', 'm');
+      const mm = re.exec(fm);
+      return mm ? mm[1].trim() : '';
+    };
+    const name = get('name');
+    const description = get('description');
+    const title = get('title');
+    if (!name) throw new Error('frontmatter 缺少 name 字段');
+    if (!SKILL_NAME_RE.test(name)) throw new Error('技能名称(name)需为小写字母/数字/连字符，如 cnc-my-method');
+    if (!description) throw new Error('frontmatter 缺少 description 字段');
+    const body = text.replace(/^\s*---\s*\n[\s\S]*?\n---\s*\n?/, '').trim();
+    if (!body) throw new Error('SKILL.md 正文为空（frontmatter 之后需有方法内容）');
+    return {
+      name,
+      title: title || name,
+      description,
+      content: body,
+    };
+  }
+
+  function listImportedSkillNames() {
+    try {
+      if (!existsSync(IMPORTED_SKILLS_DIR)) return [];
+      return readdirSync(IMPORTED_SKILLS_DIR, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && SKILL_NAME_RE.test(d.name))
+        .map((d) => d.name)
+        .sort();
+    } catch { return []; }
+  }
+
+  function readImportedSkill(name) {
+    if (!SKILL_NAME_RE.test(name)) return null;
+    const md = join(IMPORTED_SKILLS_DIR, name, 'SKILL.md');
+    try {
+      const raw = readFileSync(md, 'utf8');
+      const skill = parseSkillMarkdown(raw);
+      // 目录名是唯一事实来源，防止 frontmatter name 与目录名不一致
+      skill.name = name;
+      return skill;
+    } catch { return null; }
+  }
+
+  function listImportedSkills() {
+    return listImportedSkillNames().map((n) => readImportedSkill(n)).filter(Boolean);
+  }
+
+  function writeImportedSkill(skill) {
+    const dir = join(IMPORTED_SKILLS_DIR, skill.name);
+    try {
+      mkdirSync(dir, { recursive: true });
+      const md = '---\nname: ' + skill.name + '\ntitle: ' + (skill.title || skill.name) + '\ndescription: ' + skill.description + '\n---\n\n' + skill.content + '\n';
+      writeFileSync(join(dir, 'SKILL.md'), md, 'utf8');
+    } catch (e) {
+      throw new Error('保存技能失败：' + (e && e.message ? e.message : String(e)));
+    }
+  }
+
+  function deleteImportedSkill(name) {
+    if (!SKILL_NAME_RE.test(name)) return false;
+    const dir = join(IMPORTED_SKILLS_DIR, name);
+    try {
+      if (!existsSync(dir)) return false;
+      const files = readdirSync(dir);
+      for (const f of files) { try { unlinkSync(join(dir, f)); } catch { /* ignore */ } }
+      try { rmdirSync(dir); } catch { /* ignore */ }
+      return true;
+    } catch { return false; }
+  }
+
+  // 内嵌技能 + 导入技能 合并（内嵌优先；导入的加 imported:true 标记）。
+  function allSkills() {
+    const imported = listImportedSkills().map((s) => ({ ...s, imported: true }));
+    // 内嵌优先排前面，导入的按名称排后面
+    const seen = new Set(SKILLS.map((s) => s.name));
+    return [...SKILLS, ...imported.filter((s) => !seen.has(s.name))];
+  }
+
   log('info', 'plugin:start', {
     version: readOwnVersion(),
     freecadConfigured: typeof freecadBin === 'string' && freecadBin.trim() ? freecadBin.trim() : null,
@@ -1317,7 +1459,7 @@ export function apply(ctx, config = {}) {
       },
     }));
 
-    // 插件支持的 skill 列表（供主界面「支持技能」弹窗展示 + 详情查看）
+    // 插件支持的 skill 列表（供主界面「支持技能」弹窗展示 + 详情查看 + 导入）
     routeDisposers.push(server.register({
       kind: 'prefix',
       path: '/dsh-cam/skills',
@@ -1325,14 +1467,41 @@ export function apply(ctx, config = {}) {
         try {
           const url = new URL(req.url ?? '/', 'http://localhost');
           const name = url.searchParams.get('name');
-          if (name) {
-            // 单个 skill 详情：返回正文（方法内容），供弹窗查看/引用
-            const skill = SKILLS.find((s) => s.name === name);
-            if (!skill) { send(res, { ok: false, error: 'skill not found: ' + name }, 404); return; }
-            send(res, { ok: true, skill: { ...skill, content: readSkillBody(name) } });
+          if (req.method === 'POST') {
+            const parsed = await readBody(req);
+            // 导入：body { md: string }（SKILL.md 原文）——提炼的成功方法
+            if (parsed.op === 'import') {
+              try {
+                const skill = parseSkillMarkdown(parsed.md);
+                writeImportedSkill(skill);
+                send(res, { ok: true, skill, message: `技能已导入：${skill.title}（调用名 ${skill.name}）` });
+              } catch (e) {
+                send(res, { ok: false, error: String(e && e.message ? e.message : String(e)) }, 400);
+              }
+              return;
+            }
+            // 删除：body { name: string }（仅导入的技能可删）
+            if (parsed.op === 'delete') {
+              const n = String(parsed.name || '');
+              if (!n || !SKILL_NAME_RE.test(n)) { send(res, { ok: false, error: '技能名称非法' }, 400); return; }
+              if (SKILLS.some((s) => s.name === n)) { send(res, { ok: false, error: '内嵌技能不可删除' }, 400); return; }
+              const ok = deleteImportedSkill(n);
+              send(res, { ok, deleted: ok });
+              return;
+            }
+            send(res, { ok: false, error: 'unknown op' }, 400);
             return;
           }
-          send(res, { ok: true, skills: SKILLS });
+          // 单个 skill 详情：先查内嵌，再查导入（正文附工具调用规范）
+          if (name) {
+            const builtin = SKILLS.find((s) => s.name === name);
+            if (builtin) { send(res, { ok: true, skill: { ...builtin, content: withToolRef(readSkillBody(name)) } }); return; }
+            const imported = readImportedSkill(name);
+            if (imported) { send(res, { ok: true, skill: { ...imported, content: withToolRef(imported.content) } }); return; }
+            send(res, { ok: false, error: 'skill not found: ' + name }, 404);
+            return;
+          }
+          send(res, { ok: true, skills: allSkills() });
         } catch (e) {
           send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
         }
@@ -1680,20 +1849,19 @@ export function apply(ctx, config = {}) {
     }
   } catch { /* 斜杠命令不可用则跳过，不影响工具本身 */ }
 
-  // ---- 内嵌 CNC 工艺 skill（cnc-process-card + cnc-auto-annotate）----
+  // ---- 内嵌 CNC 工艺 skill + 用户导入技能 ----
   // 通过 ctx.skills.register 注册运行时 skill：随插件发布，任何装本插件的人都能用
   // skill 工具调用。可选服务：无 skills 服务时静默跳过，不影响其余功能。
-  // SKILLS 常量定义在 apply 开头（唯一数据源），此处直接使用。
+  // SKILLS 常量定义在 apply 开头（内嵌技能唯一数据源），导入技能读自 IMPORTED_SKILLS_DIR。
   let disposeSkill = () => {};
   try {
-    // 单个 skill 的注册：读 SKILL.md，剥 frontmatter，用 name/description 注册。
-    const registerOne = (host, skill) => {
+    // 单个 skill 的注册：读 SKILL.md 正文，用 name/description 注册。导入技能直接给 content。
+    const registerOne = (host, skill, content) => {
       if (!host || typeof host.skills?.register !== 'function') return () => {};
-      const body = readSkillBody(skill.name);
+      const body = content != null ? content : readSkillBody(skill.name);
       if (!body) return () => {};
       try {
-        return host.skills.register({ name: skill.name, description: skill.description, content: body });
-      } catch (e) {
+        return host.skills.register({ name: skill.name, description: skill.description, content: withToolRef(body) });      } catch (e) {
         log('warn', 'skill:register-failed', { name: skill.name, error: e && e.message ? e.message : String(e) });
         return () => {};
       }
@@ -1701,6 +1869,7 @@ export function apply(ctx, config = {}) {
     const registerSkills = (host) => {
       const disposers = [];
       for (const s of SKILLS) disposers.push(registerOne(host, s));
+      for (const s of listImportedSkills()) disposers.push(registerOne(host, s, s.content));
       return () => { disposers.forEach((d) => { try { d(); } catch { /* ignore */ } }); };
     };
     if (typeof ctx.inject === 'function') {

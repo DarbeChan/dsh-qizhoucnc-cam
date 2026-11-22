@@ -995,6 +995,7 @@ window.__ModuleLoader__.load({
       const [initialText, setInitialText] = React.useState('');
       const taRef = React.useRef(null);
       const textRef = React.useRef(''); // 当前文本的镜像，避免频繁 split 全串
+      const gutterRef = React.useRef(null); // 行号栏（与 textarea 同步滚动/换行）
       // 查找：Ctrl+F / Cmd+F
       const [findOpen, setFindOpen] = React.useState(false);
       const [findQuery, setFindQuery] = React.useState('');
@@ -1169,7 +1170,38 @@ window.__ModuleLoader__.load({
         let n = 1, p = 0;
         while ((p = v.indexOf('\n', p)) !== -1) { n++; p++; }
         setLineCount((prev) => (prev === n ? prev : n));
+        syncGutter();
       };
+
+      // 生成行号文本（1..N），与 textarea 的 scrollTop 对齐（通过外层容器同步滚动）。
+      const syncGutter = React.useCallback(() => {
+        const ta = taRef.current;
+        const g = gutterRef.current;
+        if (!ta || !g) return;
+        g.scrollTop = ta.scrollTop;
+        g.scrollLeft = ta.scrollLeft;
+        // 行号与文本行一一对应：每行一个数字
+        const n = lineCount;
+        if (g.textContent !== undefined) {
+          let s = '';
+          for (let i = 1; i <= n; i++) s += (s ? '\n' : '') + i;
+          if (g.textContent !== s) g.textContent = s;
+        }
+      }, [lineCount]);
+
+      // 编辑器滚动时同步行号栏（textarea 的 scroll 事件）
+      const onEditorScroll = (e) => {
+        const g = gutterRef.current;
+        if (g) { g.scrollTop = e.target.scrollTop; g.scrollLeft = e.target.scrollLeft; }
+      };
+
+      // 文件加载/版本变化后重建行号
+      React.useEffect(() => {
+        if (!loaded) return;
+        // 稍等 DOM 就绪再同步（textarea defaultValue 已渲染）
+        const t = setTimeout(() => syncGutter(), 0);
+        return () => clearTimeout(t);
+      }, [loaded, version, lineCount, syncGutter]);
 
       return h('div', { style: { flex: 1, minHeight: 0, minWidth: 0, width: '100%', display: 'flex', flexDirection: 'column', background: 'var(--dsw-alias-bg-base, #fff)' } },
         h('div', { style: ED_HEAD },
@@ -1195,11 +1227,31 @@ window.__ModuleLoader__.load({
           h('button', { style: { ...edBtnGhost, fontSize: 11, padding: '2px 8px' }, onClick: () => doFind(1), title: '下一个 (Enter)' }, '↓'),
           h('button', { style: { ...edBtnGhost, fontSize: 11, padding: '2px 8px' }, onClick: closeFind, title: '关闭查找 (Esc)' }, '✕'))
         : null,
-        h('textarea', {
-          ref: taRef, key: version, style: edTextarea, defaultValue: initialText, spellCheck: false, autoCapitalize: 'off', autoCorrect: 'off',
-          placeholder: loaded ? '' : '加载中…',
-          onChange: onChange, onKeyDown: onKey, onContextMenu: onContextMenu,
-        }),
+        h('div', {
+          style: {
+            flex: 1, minHeight: 0, display: 'flex', position: 'relative', overflow: 'hidden',
+            background: 'var(--dsw-alias-bg-base, #fff)',
+          },
+        },
+          h('div', {
+            ref: gutterRef,
+            style: {
+              flex: 'none', width: 46, overflow: 'hidden', textAlign: 'right',
+              padding: '12px 8px 12px 0', boxSizing: 'border-box',
+              fontFamily: 'var(--dsw-alias-font-code, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace)',
+              fontSize: 13.5, lineHeight: 1.6,
+              color: 'var(--dsw-alias-label-tertiary, #9ca3af)',
+              background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)',
+              borderRight: '1px solid var(--dsw-alias-border-l1, #e5e7eb)',
+              whiteSpace: 'pre', userSelect: 'none', pointerEvents: 'none',
+              WebkitTextSizeAdjust: '100%',
+            },
+          }),
+          h('textarea', {
+            ref: taRef, key: version, style: { ...edTextarea, flex: 1 }, defaultValue: initialText, spellCheck: false, autoCapitalize: 'off', autoCorrect: 'off',
+            placeholder: loaded ? '' : '加载中…',
+            onChange: onChange, onKeyDown: onKey, onContextMenu: onContextMenu, onScroll: onEditorScroll,
+          })),
         menu ? h('div', {
           style: {
             position: 'fixed', left: menu.x, top: menu.y, zIndex: 1200, minWidth: 160,
@@ -1366,10 +1418,16 @@ window.__ModuleLoader__.load({
       const [logInfo, setLogInfo] = React.useState(null); // { file, size, lines, text } | null
       const [logLoading, setLogLoading] = React.useState(false);
       // 插件支持的 skill 列表（主界面「支持技能」弹窗展示）
-      const [skillsList, setSkillsList] = React.useState([]); // [{ name, title, description }]
+      const [skillsList, setSkillsList] = React.useState([]); // [{ name, title, description, imported }]
       // 支持技能弹窗：开关 + 当前查看详情的 skill（含 content 正文）
       const [showSkills, setShowSkills] = React.useState(false);
-      const [skillDetail, setSkillDetail] = React.useState(null); // { name, title, description, content } | null
+      const [skillDetail, setSkillDetail] = React.useState(null); // { name, title, description, content, imported } | null
+      // 导入技能：上传 SKILL.md 文件（提炼的成功方法）
+      const [importOpen, setImportOpen] = React.useState(false);
+      const [importText, setImportText] = React.useState(''); // 直接粘贴 SKILL.md 文本
+      const [importBusy, setImportBusy] = React.useState(false);
+      const [importMsg, setImportMsg] = React.useState(null); // { ok, text } | null
+      const skillFileRef = React.useRef(null); // 隐藏 <input type=file> 选 SKILL.md
       // 版本更新检查（右下角：版本号 / 更新提醒 / 手动更新）
       const [versionInfo, setVersionInfo] = React.useState(null); // { current, latest, updateAvailable }
       const [updating, setUpdating] = React.useState(false); // 是否正在执行更新
@@ -1736,6 +1794,60 @@ window.__ModuleLoader__.load({
             if (fallback) setSkillDetail({ ...fallback, content: '（完整方法内容需重启后加载）\n\n' + fallback.description });
           });
       }, []);
+
+      // ---- 导入技能（上传 SKILL.md 提炼的成功方法）----
+      const openImport = React.useCallback(() => {
+        setImportOpen(true);
+        setImportText('');
+        setImportMsg(null);
+        setSkillDetail(null);
+      }, []);
+      const pickSkillFile = React.useCallback(() => { if (skillFileRef.current) skillFileRef.current.click(); }, []);
+      const onSkillFileChosen = React.useCallback((e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          const text = String(reader.result || '');
+          setImportText(text);
+          setImportMsg(null);
+        };
+        reader.onerror = () => setImportMsg({ ok: false, text: '读取文件失败' });
+        reader.readAsText(file);
+        e.target.value = '';
+      }, []);
+      const doImportSkill = React.useCallback(() => {
+        const md = importText.trim();
+        if (!md) { setImportMsg({ ok: false, text: '请先粘贴或选择 SKILL.md 内容' }); return; }
+        setImportBusy(true); setImportMsg(null);
+        post('/dsh-cam/skills', { op: 'import', md })
+          .then((d) => {
+            if (d && d.ok && d.skill) {
+              setImportMsg({ ok: true, text: '已导入「' + (d.skill.title || d.skill.name) + '」（调用名：' + d.skill.name + '，用途：' + d.skill.description + '）' });
+              setImportText('');
+              loadSkills();
+            } else {
+              setImportMsg({ ok: false, text: d && d.error ? d.error : '导入失败' });
+            }
+          })
+          .catch((e) => setImportMsg({ ok: false, text: String(e) }))
+          .finally(() => setImportBusy(false));
+      }, [importText, post, loadSkills]);
+      const removeImportedSkill = React.useCallback((name) => {
+        if (!name) return;
+        setImportBusy(true); setImportMsg(null);
+        post('/dsh-cam/skills', { op: 'delete', name })
+          .then((d) => {
+            if (d && d.ok) {
+              setImportMsg({ ok: true, text: '已删除技能 ' + name });
+              loadSkills();
+            } else {
+              setImportMsg({ ok: false, text: d && d.error ? d.error : '删除失败' });
+            }
+          })
+          .catch((e) => setImportMsg({ ok: false, text: String(e) }))
+          .finally(() => setImportBusy(false));
+      }, [post, loadSkills]);
 
       // 把当前查看的技能方法引用到对话框（复用 NcEditor 同款 inputHub 解析逻辑）
       const quoteSkill = React.useCallback(() => {
@@ -2697,8 +2809,43 @@ window.__ModuleLoader__.load({
                 },
                   h('div', { style: { fontSize: 15, fontWeight: 700, color: '#1f2937', display: 'flex', alignItems: 'center', gap: 8 } },
                     '支持技能',
-                    h('span', { style: { fontSize: 11, fontWeight: 400, color: 'var(--dsw-alias-label-tertiary, #9ca3af)' } },
-                      '本插件内嵌的 CNC 加工技能，点击查看完整方法，可直接引用到对话')),
+                    h('span', { style: { fontSize: 11, fontWeight: 400, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', flex: 1 } },
+                      '点击查看完整方法，可引用到对话；也可导入你提炼的成功方法'),
+                    h('button', {
+                      onClick: openImport,
+                      style: { ...btnPrimary, fontSize: 12, padding: '3px 12px', flex: 'none' },
+                      title: '上传 SKILL.md，导入提炼的成功方法',
+                    }, '＋ 导入技能')),
+                  importOpen
+                    ? h('div', {
+                        style: {
+                          display: 'flex', flexDirection: 'column', gap: 8, padding: 10, borderRadius: 10,
+                          background: 'var(--dsw-alias-bg-layer-2, #f3f4f6)', border: '1px dashed var(--dsw-alias-state-business-primary, #2563eb)',
+                        },
+                      },
+                        h('div', { style: { fontSize: 12, fontWeight: 600, color: 'var(--dsw-alias-label-primary, #111)' } },
+                          '导入技能（SKILL.md）'),
+                        h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', lineHeight: '16px' } },
+                          'frontmatter 需含 name（小写字母/数字/连字符）与 description（用途）；正文写方法步骤。导入后会自动告知技能名称与用途。'),
+                        h('div', { style: { display: 'flex', gap: 6 } },
+                          h('button', { onClick: pickSkillFile, style: { ...btn, fontSize: 12, padding: '4px 10px' } }, '选择 SKILL.md 文件'),
+                          h('input', { ref: skillFileRef, type: 'file', accept: '.md,.markdown,text/markdown,text/plain', style: { display: 'none' }, onChange: onSkillFileChosen }),
+                          h('span', { style: { flex: 1, fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', alignSelf: 'center' } }, importText ? '已读取 ' + importText.length + ' 字符' : '或直接粘贴到下方')),
+                        h('textarea', {
+                          style: {
+                            ...edTextarea, flex: 'none', minHeight: 120, height: 120, padding: '8px 10px',
+                            border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', borderRadius: 8,
+                            fontSize: 11.5, lineHeight: '1.6',
+                          },
+                          value: importText,
+                          placeholder: '---\nname: cnc-my-method\ntitle: 我的方法\ndescription: 这个方法用于…\n---\n\n# 方法步骤\n…',
+                          onChange: (e) => { setImportText(e.target.value); setImportMsg(null); },
+                        }),
+                        importMsg ? h('div', { style: { fontSize: 11.5, color: importMsg.ok ? '#16a34a' : 'var(--dsw-alias-state-error-primary, #dc2626)', lineHeight: '16px', wordBreak: 'break-word' } }, importMsg.text) : null,
+                        h('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
+                          h('button', { onClick: () => setImportOpen(false), style: { ...btn, fontSize: 12, padding: '4px 10px' } }, '取消'),
+                          h('button', { onClick: doImportSkill, disabled: importBusy || !importText.trim(), style: { ...btnPrimary, fontSize: 12, padding: '4px 14px' } }, importBusy ? '导入中…' : '导入')))
+                      : null,
                   skillDetail
                     // 详情态：展示单个 skill 的完整方法 + 引用按钮
                     ? h(React.Fragment, null,
@@ -2744,8 +2891,14 @@ window.__ModuleLoader__.load({
                             },
                               h('span', { style: { fontSize: 13, fontWeight: 700, color: 'var(--dsw-alias-state-business-primary, #2563eb)', whiteSpace: 'nowrap' } }, s.title || s.name),
                               h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', fontFamily: 'ui-monospace, Menlo, Consolas, monospace', whiteSpace: 'nowrap' } }, s.name),
+                              s.imported ? h('span', { style: { fontSize: 10, color: '#b45309', background: 'rgba(245,158,11,0.15)', border: '1px solid rgba(245,158,11,0.4)', padding: '0 6px', borderRadius: 8, whiteSpace: 'nowrap', flex: 'none' }, title: '用户导入的技能' }, '导入') : null,
                               h('span', { style: { flex: 1, fontSize: 11.5, color: 'var(--dsw-alias-label-secondary, #6b7280)', lineHeight: '16px', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' } }, s.description),
-                              h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', whiteSpace: 'nowrap' } }, '查看 →')))
+                              h('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', whiteSpace: 'nowrap' } }, '查看 →'),
+                              s.imported ? h('button', {
+                                onClick: (e) => { e.stopPropagation(); removeImportedSkill(s.name); },
+                                title: '删除此导入技能',
+                                style: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 20, height: 20, fontSize: 12, lineHeight: 1, cursor: 'pointer', borderRadius: '50%', border: 'none', background: 'transparent', color: 'var(--dsw-alias-state-error-primary, #dc2626)', padding: 0, flex: 'none' },
+                              }, '✕') : null))
                           : h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', textAlign: 'center', padding: '20px 0' } }, '加载技能列表…')),
                   h('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
                     h('button', { onClick: () => { setShowSkills(false); setSkillDetail(null); }, style: { ...btnPrimary, fontSize: 12, padding: '4px 16px' } }, '关闭'))))
