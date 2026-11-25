@@ -2,6 +2,18 @@
 
 本文件记录 DSH-QizhouCNC_CAM 的各版本变更。
 
+## [1.3.38] - 2026-11-25
+
+### 修复 (Fixed)
+
+- **更新提示「locally linked plugins update from their checkout」**：版本检查改用 dshmarket 公共更新 API（`/dsh-market/api/v1/updates`）判断「是否可更新」，正确识别 npm / github / linked 安装源。npm 与 github 安装的副本正常更新；本地 file:/link: 开发副本不再误触发更新，改为友好提示「需到插件市场手动更新或恢复安装」。兼容其它电脑以 npm 安装时的更新流程。
+
+### 新增 (Added)
+
+- **按文件夹导入技能**：导入技能改为**选择技能所在文件夹**（原生目录选择器）。文件夹根目录放技能说明文件（`SKILL.md` / `skill.md`，大小写不敏感），工具放在 `tool/`（或 `Tool` / `TOOLS` 等，大小写不敏感）子目录内。导入时**整个文件夹复制**到 qizhouCNC_CAM 工作目录（`~/.dsh/storages/dsh-cam-skills/<name>/`），自包含、不依赖原路径，方便打包更新版本时一起带上工具。保留「粘贴单个 SKILL.md 文本」兜底。
+
+---
+
 ## [1.3.37] - 2026-11-22
 
 ### 新增 (Added)

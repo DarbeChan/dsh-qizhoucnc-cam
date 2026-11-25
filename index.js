@@ -1009,6 +1009,70 @@ export function apply(ctx, config = {}) {
     };
   }
 
+  // 递归复制目录（技能文件夹整体复制到插件工作目录，自包含、不依赖原路径）。
+  function copyDirRecursive(src, dst) {
+    mkdirSync(dst, { recursive: true });
+    for (const e of readdirSync(src, { withFileTypes: true })) {
+      const s = join(src, e.name);
+      const d = join(dst, e.name);
+      if (e.isDirectory()) copyDirRecursive(s, d);
+      else if (e.isFile()) copyFileSync(s, d);
+      // 符号链接/其它类型跳过，避免复制到越界内容
+    }
+  }
+
+  // 递归删除目录（删除导入技能时连同其 tool/ 等子目录一起清掉）。
+  function removeDirRecursive(dir) {
+    if (!existsSync(dir)) return;
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) removeDirRecursive(p);
+      else { try { unlinkSync(p); } catch { /* ignore */ } }
+    }
+    try { rmdirSync(dir); } catch { /* ignore */ }
+  }
+
+  // 在技能文件夹根目录查找技能说明文件：优先 basename 以 skill.md 结尾（大小写不敏感），
+  // 回退到任意 .md（大小写不敏感）。返回绝对路径或 null。
+  function findSkillFile(dir) {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return null; }
+    const files = entries.filter((e) => e.isFile());
+    const skill = files.find((f) => /skill\.md$/i.test(f.name));
+    if (skill) return join(dir, skill.name);
+    const md = files.find((f) => /\.md$/i.test(f.name));
+    return md ? join(dir, md.name) : null;
+  }
+
+  // 列出技能文件夹根目录下的工具目录（大小写不敏感的 tool / tools）。
+  function listToolDirs(dir) {
+    try {
+      return readdirSync(dir, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && /^tools?$/i.test(e.name))
+        .map((e) => e.name)
+        .sort();
+    } catch { return []; }
+  }
+
+  // 从用户选择的文件夹导入技能：扫描 skill 说明 + 整体复制（含 tool/ 工具目录）到插件工作目录。
+  function importSkillFromDir(srcDir) {
+    const src = String(srcDir || '').trim();
+    if (!src) throw new Error('未提供技能文件夹路径');
+    if (!existsSync(src)) throw new Error('技能文件夹不存在：' + src);
+    let st;
+    try { st = statSync(src); } catch { throw new Error('无法读取技能文件夹：' + src); }
+    if (!st.isDirectory()) throw new Error('请选择一个技能文件夹，而不是单个文件');
+    const skillFile = findSkillFile(src);
+    if (!skillFile) throw new Error('该文件夹根目录没有找到技能说明文件（需以 SKILL.md/skill.md 结尾的 .md 文件）');
+    let raw;
+    try { raw = readFileSync(skillFile, 'utf8'); } catch { throw new Error('读取技能说明文件失败：' + skillFile); }
+    const skill = parseSkillMarkdown(raw);
+    const destDir = join(IMPORTED_SKILLS_DIR, skill.name);
+    // 复制整个文件夹（含 tool/ 等工具目录）到插件工作目录，自包含、不依赖原路径
+    copyDirRecursive(src, destDir);
+    return { skill, destDir, toolDirs: listToolDirs(destDir) };
+  }
+
   function listImportedSkillNames() {
     try {
       if (!existsSync(IMPORTED_SKILLS_DIR)) return [];
@@ -1021,7 +1085,9 @@ export function apply(ctx, config = {}) {
 
   function readImportedSkill(name) {
     if (!SKILL_NAME_RE.test(name)) return null;
-    const md = join(IMPORTED_SKILLS_DIR, name, 'SKILL.md');
+    const dir = join(IMPORTED_SKILLS_DIR, name);
+    const md = findSkillFile(dir);
+    if (!md) return null;
     try {
       const raw = readFileSync(md, 'utf8');
       const skill = parseSkillMarkdown(raw);
@@ -1051,9 +1117,7 @@ export function apply(ctx, config = {}) {
     const dir = join(IMPORTED_SKILLS_DIR, name);
     try {
       if (!existsSync(dir)) return false;
-      const files = readdirSync(dir);
-      for (const f of files) { try { unlinkSync(join(dir, f)); } catch { /* ignore */ } }
-      try { rmdirSync(dir); } catch { /* ignore */ }
+      removeDirRecursive(dir);
       return true;
     } catch { return false; }
   }
@@ -1488,10 +1552,9 @@ export function apply(ctx, config = {}) {
     }));
 
     // 版本更新检查（GET：本插件版本 + npm 最新版本 + 是否有更新）。
-    // 实际的「点击更新」由客户端直接调用 dshmarket 的公共更新 API 完成，
-    // 因为该 API 需要浏览器会话 cookie（同源保护），宿主进程拿不到。
-    // 只有以 npm 包名 dsh-qizhoucnc-cam 安装时，市场更新 API 才能定位并更新它；
-    // 本地 file:/link: 开发包（@local/dsh-cam）返回 updatable:false，客户端只显示版本号。
+    // 用 dshmarket 的公共更新 API 判断「是否可更新」：npm 安装的副本返回 source=npm 且 updateAvailable 真实；
+    // 本地 file:/link: 开发包返回 source=linked 且 updateAvailable=false（市场拒绝「本地链接插件从其 checkout 更新」）。
+    // 这样其它电脑上以 npm 安装时能正确更新，本机开发副本则只显示版本号、不误触发更新。
     routeDisposers.push(server.register({
       kind: 'prefix',
       path: '/dsh-cam/version',
@@ -1500,14 +1563,40 @@ export function apply(ctx, config = {}) {
           const pkg = readOwnPackage();
           const current = pkg.version;
           const pkgName = pkg.name;
-          // 只有以 npm 包名安装的副本才可经市场更新 API 更新。
-          const updatable = pkgName === PKG_NAME;
           let latest = null;
-          if (updatable) {
-            try { latest = await fetchNpmLatest(); } catch { /* 网络失败则 latest 为 null */ }
+          let updateAvailable = false;
+          let updatable = false;
+          let source = null;
+          // 优先走 dshmarket 公共 API（同源，其它电脑/浏览器都能用；会识别 npm vs linked）。
+          try {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 8000);
+            const mres = await fetch('/dsh-market/api/v1/updates?name=' + encodeURIComponent(PKG_NAME), {
+              signal: ctrl.signal, headers: { accept: 'application/json' },
+            });
+            clearTimeout(timer);
+            if (mres.ok) {
+              const md = await mres.json().catch(() => ({}));
+              const pk = md && md.package ? md.package : null;
+              if (pk) {
+                source = pk.source || null;
+                latest = typeof pk.latestVersion === 'string' ? pk.latestVersion : latest;
+                updateAvailable = !!pk.updateAvailable;
+                // 只有市场能走标准更新路径的源才标记可更新：npm / github(git)。
+                // linked(本地 file:/link:) 与 generation 源，市场会拒绝（"locally linked plugins update from their checkout"）。
+                updatable = source === 'npm' || source === 'github';
+              }
+            }
+          } catch { /* 市场 API 不可用则退回 npm registry 判断 */ }
+          // 回退：市场 API 不可用时，用 npm 包名 + registry 判断。
+          if (source === null) {
+            if (pkgName === PKG_NAME) {
+              updatable = true;
+              try { latest = await fetchNpmLatest(); } catch { /* 网络失败则 latest 为 null */ }
+              updateAvailable = !!(latest && current) && compareVersions(latest, current) > 0;
+            }
           }
-          const updateAvailable = updatable && latest && current ? compareVersions(latest, current) > 0 : false;
-          send(res, { ok: true, pkgName: pkgName || '', current: current || '1.0.0', latest, updateAvailable, updatable });
+          send(res, { ok: true, pkgName: pkgName || '', current: current || '1.0.0', latest, updateAvailable, updatable, source });
         } catch (e) {
           send(res, { ok: false, error: String(e && e.message ? e.message : e) }, 400);
         }
@@ -1524,12 +1613,20 @@ export function apply(ctx, config = {}) {
           const name = url.searchParams.get('name');
           if (req.method === 'POST') {
             const parsed = await readBody(req);
-            // 导入：body { md: string }（SKILL.md 原文）——提炼的成功方法
+            // 导入：body { dir: string }（技能文件夹路径）或 { md: string }（SKILL.md 原文）
             if (parsed.op === 'import') {
               try {
-                const skill = parseSkillMarkdown(parsed.md);
-                writeImportedSkill(skill);
-                send(res, { ok: true, skill, message: `技能已导入：${skill.title}（调用名 ${skill.name}）` });
+                if (typeof parsed.dir === 'string' && parsed.dir.trim()) {
+                  const r = importSkillFromDir(parsed.dir);
+                  send(res, {
+                    ok: true, skill: r.skill, destDir: r.destDir, toolDirs: r.toolDirs,
+                    message: `技能已导入：${r.skill.title}（调用名 ${r.skill.name}）${r.toolDirs.length ? '，含工具目录 ' + r.toolDirs.join(', ') : ''}`,
+                  });
+                } else {
+                  const skill = parseSkillMarkdown(parsed.md);
+                  writeImportedSkill(skill);
+                  send(res, { ok: true, skill, message: `技能已导入：${skill.title}（调用名 ${skill.name}）` });
+                }
               } catch (e) {
                 send(res, { ok: false, error: String(e && e.message ? e.message : String(e)) }, 400);
               }

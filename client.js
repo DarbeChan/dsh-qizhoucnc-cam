@@ -1422,9 +1422,10 @@ window.__ModuleLoader__.load({
       // 支持技能弹窗：开关 + 当前查看详情的 skill（含 content 正文）
       const [showSkills, setShowSkills] = React.useState(false);
       const [skillDetail, setSkillDetail] = React.useState(null); // { name, title, description, content, imported } | null
-      // 导入技能：上传 SKILL.md 文件（提炼的成功方法）
+      // 导入技能：选择技能文件夹（含 SKILL.md + tool/ 工具目录）
       const [importOpen, setImportOpen] = React.useState(false);
-      const [importText, setImportText] = React.useState(''); // 直接粘贴 SKILL.md 文本
+      const [importText, setImportText] = React.useState(''); // 直接粘贴 SKILL.md 文本（兜底）
+      const [importDir, setImportDir] = React.useState(''); // 已选技能文件夹路径
       const [importBusy, setImportBusy] = React.useState(false);
       const [importMsg, setImportMsg] = React.useState(null); // { ok, text } | null
       const skillFileRef = React.useRef(null); // 隐藏 <input type=file> 选 SKILL.md
@@ -1795,12 +1796,25 @@ window.__ModuleLoader__.load({
           });
       }, []);
 
-      // ---- 导入技能（上传 SKILL.md 提炼的成功方法）----
+      // ---- 导入技能（选择技能文件夹，含 SKILL.md + tool/ 工具目录，整体复制到插件工作目录）----
       const openImport = React.useCallback(() => {
         setImportOpen(true);
         setImportText('');
+        setImportDir('');
         setImportMsg(null);
         setSkillDetail(null);
+      }, []);
+      // 用原生目录选择器选技能文件夹
+      const pickSkillFolder = React.useCallback(async () => {
+        try {
+          const picker = globalThis.__DSH_DIRECTORY_PICKER__;
+          const dir = picker ? await picker.pick() : null;
+          if (typeof dir === 'string' && dir) {
+            setImportDir(dir);
+            setImportText('');
+            setImportMsg(null);
+          }
+        } catch (e) { setImportMsg({ ok: false, text: String(e && e.message ? e.message : e) }); }
       }, []);
       const pickSkillFile = React.useCallback(() => { if (skillFileRef.current) skillFileRef.current.click(); }, []);
       const onSkillFileChosen = React.useCallback((e) => {
@@ -1810,6 +1824,7 @@ window.__ModuleLoader__.load({
         reader.onload = () => {
           const text = String(reader.result || '');
           setImportText(text);
+          setImportDir('');
           setImportMsg(null);
         };
         reader.onerror = () => setImportMsg({ ok: false, text: '读取文件失败' });
@@ -1817,14 +1832,19 @@ window.__ModuleLoader__.load({
         e.target.value = '';
       }, []);
       const doImportSkill = React.useCallback(() => {
+        const dir = importDir.trim();
         const md = importText.trim();
-        if (!md) { setImportMsg({ ok: false, text: '请先粘贴或选择 SKILL.md 内容' }); return; }
+        if (!dir && !md) { setImportMsg({ ok: false, text: '请先选择技能文件夹（或粘贴 SKILL.md 内容）' }); return; }
         setImportBusy(true); setImportMsg(null);
-        post('/dsh-cam/skills', { op: 'import', md })
+        // 优先按文件夹导入（自包含复制，含 tool/ 工具目录）；无文件夹时退回粘贴文本导入
+        const body = dir ? { op: 'import', dir } : { op: 'import', md };
+        post('/dsh-cam/skills', body)
           .then((d) => {
             if (d && d.ok && d.skill) {
-              setImportMsg({ ok: true, text: '已导入「' + (d.skill.title || d.skill.name) + '」（调用名：' + d.skill.name + '，用途：' + d.skill.description + '）' });
+              const tools = (d.toolDirs && d.toolDirs.length) ? '，含工具目录 ' + d.toolDirs.join(', ') : '';
+              setImportMsg({ ok: true, text: '已导入「' + (d.skill.title || d.skill.name) + '」（调用名：' + d.skill.name + '，用途：' + d.skill.description + '）' + tools + '。已复制到插件工作目录。' });
               setImportText('');
+              setImportDir('');
               loadSkills();
             } else {
               setImportMsg({ ok: false, text: d && d.error ? d.error : '导入失败' });
@@ -1832,7 +1852,7 @@ window.__ModuleLoader__.load({
           })
           .catch((e) => setImportMsg({ ok: false, text: String(e) }))
           .finally(() => setImportBusy(false));
-      }, [importText, post, loadSkills]);
+      }, [importDir, importText, post, loadSkills]);
       const removeImportedSkill = React.useCallback((name) => {
         if (!name) return;
         setImportBusy(true); setImportMsg(null);
@@ -1937,12 +1957,15 @@ window.__ModuleLoader__.load({
           .then((r) => r.json())
           .then((d) => {
             if (d && d.ok) {
-              const info = { current: d.current, latest: d.latest, updateAvailable: !!d.updateAvailable };
+              const info = { current: d.current, latest: d.latest, updateAvailable: !!d.updateAvailable, updatable: !!d.updatable, source: d.source };
               setVersionInfo(info);
-              if (d.updateAvailable) {
-                // 有新版本：直接触发自动更新
+              if (d.updateAvailable && d.updatable) {
+                // 有新版本且可经市场更新：直接触发自动更新
                 setErr('发现新版本 v' + d.latest + '，正在自动更新…');
                 doUpdate();
+              } else if (d.updateAvailable && !d.updatable) {
+                // 本地 file:/link: 开发包：市场不支持从其 checkout 更新，只提示、不触发
+                setErr('发现新版本 v' + d.latest + '，但当前是本地开发安装（file/link），需到「设置 → 插件市场」手动更新，或等作者发布 npm 后恢复安装。');
               } else {
                 setErr('当前已是最新版本 v' + (d.current || ''));
               }
@@ -2814,7 +2837,7 @@ window.__ModuleLoader__.load({
                     h('button', {
                       onClick: openImport,
                       style: { ...btnPrimary, fontSize: 12, padding: '3px 12px', flex: 'none' },
-                      title: '上传 SKILL.md，导入提炼的成功方法',
+                      title: '选择技能文件夹（含 SKILL.md 与 tool/ 工具目录），整体复制导入',
                     }, '＋ 导入技能')),
                   importOpen
                     ? h('div', {
@@ -2824,27 +2847,33 @@ window.__ModuleLoader__.load({
                         },
                       },
                         h('div', { style: { fontSize: 12, fontWeight: 600, color: 'var(--dsw-alias-label-primary, #111)' } },
-                          '导入技能（SKILL.md）'),
+                          '导入技能（选择技能文件夹）'),
                         h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', lineHeight: '16px' } },
-                          'frontmatter 需含 name（小写字母/数字/连字符）与 description（用途）；正文写方法步骤。导入后会自动告知技能名称与用途。'),
+                          '选择技能所在的文件夹：根目录放技能说明文件（SKILL.md / skill.md，大小写均可），' +
+                          '工具放在 tool/（或 Tool/TOOL 等，大小写均可）子目录内。导入时整个文件夹会复制到 qizhouCNC_CAM 工作目录，' +
+                          '方便你打包更新版本时一起带上这些工具。'),
+                        h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+                          h('button', { onClick: pickSkillFolder, style: { ...btnPrimary, fontSize: 12, padding: '4px 10px' } }, '选择技能文件夹'),
+                          h('span', { style: { flex: 1, fontSize: 11, color: 'var(--dsw-alias-label-secondary, #6b7280)', wordBreak: 'break-all', minWidth: 0 } }, importDir || '（尚未选择）')),
+                        h('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', lineHeight: '16px' } },
+                          '或只粘贴单个 SKILL.md 内容（无工具目录时用）：'),
                         h('div', { style: { display: 'flex', gap: 6 } },
                           h('button', { onClick: pickSkillFile, style: { ...btn, fontSize: 12, padding: '4px 10px' } }, '选择 SKILL.md 文件'),
-                          h('input', { ref: skillFileRef, type: 'file', accept: '.md,.markdown,text/markdown,text/plain', style: { display: 'none' }, onChange: onSkillFileChosen }),
-                          h('span', { style: { flex: 1, fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #9ca3af)', alignSelf: 'center' } }, importText ? '已读取 ' + importText.length + ' 字符' : '或直接粘贴到下方')),
+                          h('input', { ref: skillFileRef, type: 'file', accept: '.md,.markdown,text/markdown,text/plain', style: { display: 'none' }, onChange: onSkillFileChosen })),
                         h('textarea', {
                           style: {
-                            ...edTextarea, flex: 'none', minHeight: 120, height: 120, padding: '8px 10px',
+                            ...edTextarea, flex: 'none', minHeight: 100, height: 100, padding: '8px 10px',
                             border: '1px solid var(--dsw-alias-border-l1, #e5e7eb)', borderRadius: 8,
                             fontSize: 11.5, lineHeight: '1.6',
                           },
                           value: importText,
                           placeholder: '---\nname: cnc-my-method\ntitle: 我的方法\ndescription: 这个方法用于…\n---\n\n# 方法步骤\n…',
-                          onChange: (e) => { setImportText(e.target.value); setImportMsg(null); },
+                          onChange: (e) => { setImportText(e.target.value); setImportDir(''); setImportMsg(null); },
                         }),
                         importMsg ? h('div', { style: { fontSize: 11.5, color: importMsg.ok ? '#16a34a' : 'var(--dsw-alias-state-error-primary, #dc2626)', lineHeight: '16px', wordBreak: 'break-word' } }, importMsg.text) : null,
                         h('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
                           h('button', { onClick: () => setImportOpen(false), style: { ...btn, fontSize: 12, padding: '4px 10px' } }, '取消'),
-                          h('button', { onClick: doImportSkill, disabled: importBusy || !importText.trim(), style: { ...btnPrimary, fontSize: 12, padding: '4px 14px' } }, importBusy ? '导入中…' : '导入')))
+                          h('button', { onClick: doImportSkill, disabled: importBusy || (!importDir.trim() && !importText.trim()), style: { ...btnPrimary, fontSize: 12, padding: '4px 14px' } }, importBusy ? '导入中…' : '导入')))
                       : null,
                   skillDetail
                     // 详情态：展示单个 skill 的完整方法 + 引用按钮
